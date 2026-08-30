@@ -12,36 +12,44 @@ from flask import Flask, jsonify, render_template_string
 # =====================================================================
 # 1. ENVIRONMENT CONFIGURATION & VALIDATION
 # =====================================================================
-PAPER_TRADING = os.environ.get("PAPER_TRADING", "true").strip().lower() in ("true", "1", "yes")
+PAPER_TRADING = os.environ.get("PAPER_TRADING", "false").strip().lower() in ("true", "1", "yes")
 PAPER_INITIAL_BALANCE = float(os.environ.get("PAPER_INITIAL_BALANCE", "1000.0"))
 
-API_KEY = os.environ.get("KRAKEN_API_KEY", "").strip()
-SECRET_KEY = os.environ.get("KRAKEN_SECRET_KEY", "").strip()
+# Dual Exchange Configuration
+ENABLED_EXCHANGES_RAW = os.environ.get("ENABLED_EXCHANGES", "binance,kraken").strip().lower()
+ENABLED_EXCHANGES = [e.strip() for e in ENABLED_EXCHANGES_RAW.split(",") if e.strip()]
+
+BINANCE_TESTNET = os.environ.get("BINANCE_TESTNET", "true").strip().lower() in ("true", "1", "yes")
+BINANCE_API_KEY = os.environ.get("BINANCE_API_KEY", "").strip()
+BINANCE_SECRET_KEY = os.environ.get("BINANCE_SECRET_KEY", "").strip()
+
+KRAKEN_API_KEY = os.environ.get("KRAKEN_API_KEY", "").strip()
+KRAKEN_SECRET_KEY = os.environ.get("KRAKEN_SECRET_KEY", "").strip()
 
 UPSTASH_REDIS_REST_URL = os.environ.get("UPSTASH_REDIS_REST_URL", "").strip()
 UPSTASH_REDIS_REST_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "").strip()
-REDIS_STATE_KEY = os.environ.get("REDIS_STATE_KEY", "kraken_bot_multi_state").strip()
-REDIS_LEDGER_KEY = os.environ.get("REDIS_LEDGER_KEY", "kraken_bot_multi_ledger").strip()
+REDIS_STATE_KEY = os.environ.get("REDIS_STATE_KEY", "dual_exchange_bot_state").strip()
+REDIS_LEDGER_KEY = os.environ.get("REDIS_LEDGER_KEY", "dual_exchange_bot_ledger").strip()
 
 ENABLE_TELEGRAM = os.environ.get("ENABLE_TELEGRAM", "false").strip().lower() in ("true", "1", "yes")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
-# Dynamic Market Discovery Engine
+# Discovery & Regime Parameters
 TRADING_SYMBOLS_MODE = os.environ.get("TRADING_SYMBOLS", "AUTO").strip()
 SCAN_QUOTE_CURRENCY = os.environ.get("SCAN_QUOTE_CURRENCY", "USDT").strip().upper()
-SCAN_TOP_LIQUID_PAIRS = int(os.environ.get("SCAN_TOP_LIQUID_PAIRS", "20"))
+SCAN_TOP_LIQUID_PAIRS = int(os.environ.get("SCAN_TOP_LIQUID_PAIRS", "15"))
 
 TIMEFRAME = os.environ.get("TRADING_TIMEFRAME", "15m").strip()
 ADX_TREND_THRESHOLD = float(os.environ.get("ADX_TREND_THRESHOLD", "25.0"))
 ATR_MULTIPLIER = float(os.environ.get("ATR_MULTIPLIER", "1.5"))
 
-# Dynamic Portfolio & Risk Settings
+# Risk & Portfolio Parameters
 RISK_PCT_PER_TRADE = float(os.environ.get("RISK_PCT_PER_TRADE", "0.015"))
 RR_RATIO = float(os.environ.get("RR_RATIO", "2.0"))
 MIN_LEVERAGE = float(os.environ.get("MIN_LEVERAGE", "1.0"))
 MAX_LEVERAGE = float(os.environ.get("MAX_LEVERAGE", "3.0"))
-MAX_CONCURRENT_POSITIONS = int(os.environ.get("MAX_CONCURRENT_POSITIONS", "2"))
+MAX_CONCURRENT_POSITIONS = int(os.environ.get("MAX_CONCURRENT_POSITIONS", "3"))
 MAX_PORTFOLIO_MARGIN_PCT = float(os.environ.get("MAX_PORTFOLIO_MARGIN_PCT", "0.60"))
 
 MAX_FAILURES_ALLOWED = int(os.environ.get("MAX_FAILURES_ALLOWED", "3"))
@@ -50,20 +58,20 @@ MIN_BALANCE_USDT = float(os.environ.get("MIN_BALANCE_USDT", "10.0"))
 LOOP_INTERVAL_SECONDS = int(os.environ.get("LOOP_INTERVAL_SECONDS", "300"))
 SERVER_PORT = int(os.environ.get("PORT", "10000"))
 
-CSV_FILE_PATH = "kraken_bot_trade_ledger.csv"
-STATE_FILE_PATH = "kraken_bot_state.json"
+CSV_FILE_PATH = "dual_exchange_trade_ledger.csv"
+STATE_FILE_PATH = "dual_exchange_state.json"
 
 def validate_environment():
     missing_vars = []
-    if not PAPER_TRADING:
-        if not API_KEY:
-            missing_vars.append("KRAKEN_API_KEY")
-        if not SECRET_KEY:
-            missing_vars.append("KRAKEN_SECRET_KEY")
     if not UPSTASH_REDIS_REST_URL:
         missing_vars.append("UPSTASH_REDIS_REST_URL")
     if not UPSTASH_REDIS_REST_TOKEN:
         missing_vars.append("UPSTASH_REDIS_REST_TOKEN")
+    if not PAPER_TRADING:
+        if "binance" in ENABLED_EXCHANGES and (not BINANCE_API_KEY or not BINANCE_SECRET_KEY):
+            missing_vars.append("BINANCE_API_KEY / BINANCE_SECRET_KEY")
+        if "kraken" in ENABLED_EXCHANGES and (not KRAKEN_API_KEY or not KRAKEN_SECRET_KEY):
+            missing_vars.append("KRAKEN_API_KEY / KRAKEN_SECRET_KEY")
     if ENABLE_TELEGRAM:
         if not TELEGRAM_BOT_TOKEN:
             missing_vars.append("TELEGRAM_BOT_TOKEN")
@@ -71,25 +79,54 @@ def validate_environment():
             missing_vars.append("TELEGRAM_CHAT_ID")
 
     if missing_vars:
-        fault = f"FATAL: Missing mandatory environment variables: {', '.join(missing_vars)}"
+        fault = f"FATAL: Missing required environment settings: {', '.join(missing_vars)}"
         print(f"🛑 {fault}")
         raise RuntimeError(fault)
 
 validate_environment()
 
 # =====================================================================
-# 2. SYNCHRONIZED RUNTIME STATE
+# 2. MULTI-EXCHANGE CLIENT INITIALIZATION
+# =====================================================================
+exchanges = {}
+
+if "binance" in ENABLED_EXCHANGES:
+    b_params = {'enableRateLimit': True, 'options': {'defaultType': 'spot'}}
+    if BINANCE_API_KEY and BINANCE_SECRET_KEY:
+        b_params['apiKey'] = BINANCE_API_KEY
+        b_params['secret'] = BINANCE_SECRET_KEY
+    b_client = ccxt.binance(b_params)
+    if BINANCE_TESTNET:
+        b_client.set_sandbox_mode(True)
+        print("🧪 [BINANCE] Sandbox/Testnet routing engaged.")
+    exchanges['binance'] = b_client
+
+if "kraken" in ENABLED_EXCHANGES:
+    k_params = {'enableRateLimit': True}
+    if KRAKEN_API_KEY and KRAKEN_SECRET_KEY:
+        k_params['apiKey'] = KRAKEN_API_KEY
+        k_params['secret'] = KRAKEN_SECRET_KEY
+    k_client = ccxt.kraken(k_params)
+    exchanges['kraken'] = k_client
+
+print(f"🏛️ Initialized {len(exchanges)} execution venues: {list(exchanges.keys())}")
+
+# =====================================================================
+# 3. SYNCHRONIZED MULTI-VENUE RUNTIME STATE
 # =====================================================================
 state_lock = threading.Lock()
 
-active_candidate_universe = []
+# positions schema: { "BINANCE:BTC/USDT": { exchange, symbol, position_active, entry_price, ... } }
 positions = {}
+active_candidate_universe = {}
 top_scanned_opportunities = []
 
 virtual_balance_usdt = PAPER_INITIAL_BALANCE
 consecutive_failures = 0
 
 engine_status = {
+    "venues": [e.upper() for e in exchanges.keys()],
+    "binance_testnet": BINANCE_TESTNET,
     "engine_state": "NOT_STARTED",
     "last_loop_timestamp": None,
     "last_successful_loop_timestamp": None,
@@ -116,14 +153,13 @@ def get_status_snapshot():
         total_margin_used = sum(p["margin_allocated"] for p in positions.values() if p.get("position_active", False))
         snapshot = dict(engine_status)
         snapshot.update({
-            "mode": "PAPER_TRADING" if PAPER_TRADING else "LIVE_CAPITAL",
+            "mode": "PAPER_TRADING" if PAPER_TRADING else "LIVE_OR_TESTNET",
             "virtual_balance_usdt": virtual_balance_usdt if PAPER_TRADING else None,
             "total_margin_allocated": round(total_margin_used, 2),
             "scanner_mode": TRADING_SYMBOLS_MODE,
-            "tracked_universe_count": len(active_candidate_universe),
-            "active_candidate_universe": active_candidate_universe,
+            "candidate_universe_by_venue": active_candidate_universe,
             "timeframe": TIMEFRAME,
-            "positions": {sym: dict(data) for sym, data in positions.items() if data.get("position_active", False)},
+            "positions": {key: dict(data) for key, data in positions.items() if data.get("position_active", False)},
             "top_opportunities": list(top_scanned_opportunities),
             "consecutive_failures": consecutive_failures,
             "risk_pct_per_trade": RISK_PCT_PER_TRADE,
@@ -131,16 +167,6 @@ def get_status_snapshot():
             "max_leverage": MAX_LEVERAGE
         })
     return snapshot
-
-# =====================================================================
-# 3. INITIALIZE KRAKEN EXCHANGE ENGINE
-# =====================================================================
-exchange_params = {'enableRateLimit': True}
-if API_KEY and SECRET_KEY:
-    exchange_params['apiKey'] = API_KEY
-    exchange_params['secret'] = SECRET_KEY
-
-exchange = ccxt.kraken(exchange_params)
 
 # =====================================================================
 # 4. EXTERNAL STATE PERSISTENCE (UPSTASH REST ENGINE)
@@ -160,8 +186,9 @@ def upstash_command(command_list):
 
 def save_state():
     with state_lock:
-        active_pos_only = {sym: data for sym, data in positions.items() if data.get("position_active", False)}
+        active_pos_only = {k: data for k, data in positions.items() if data.get("position_active", False)}
         state = {
+            'venues': list(exchanges.keys()),
             'paper_trading': PAPER_TRADING,
             'virtual_balance_usdt': virtual_balance_usdt,
             'positions': active_pos_only,
@@ -174,7 +201,7 @@ def save_state():
     try:
         upstash_command(["SET", REDIS_STATE_KEY, serialized_state])
     except Exception as e:
-        err_msg = f"⚠️ Primary persistence failure (Upstash Redis SET failed): {e}"
+        err_msg = f"⚠️ Persistence failure (Upstash SET failed): {e}"
         print(err_msg)
         send_telegram_notification(err_msg)
 
@@ -184,7 +211,7 @@ def save_state():
             f.write(serialized_state)
         os.replace(tmp_path, STATE_FILE_PATH)
     except Exception as e:
-        print(f"⚠️ Secondary local state save warning: {e}")
+        print(f"⚠️ Secondary local state write warning: {e}")
 
 def load_state():
     global positions, virtual_balance_usdt, consecutive_failures
@@ -194,7 +221,7 @@ def load_state():
     try:
         recovered_raw = upstash_command(["GET", REDIS_STATE_KEY])
         if recovered_raw:
-            print("🌐 Recovered state from Upstash Serverless Redis.")
+            print("🌐 Recovered multi-exchange state from Upstash.")
     except Exception as e:
         msg = f"❌ Failed to reach Upstash Redis during startup recovery: {e}"
         print(msg)
@@ -210,7 +237,7 @@ def load_state():
             except Exception as e:
                 print(f"⚠️ Failed reading local sidecar: {e}")
         else:
-            print("ℹ️ No prior state found. Initializing clean registry.")
+            print("ℹ️ No prior state found. Initializing fresh multi-venue registry.")
             return
 
     try:
@@ -221,8 +248,10 @@ def load_state():
                 virtual_balance_usdt = float(state['virtual_balance_usdt'])
 
             saved_positions = state.get('positions', {})
-            for sym, p in saved_positions.items():
+            for key, p in saved_positions.items():
                 is_active = bool(p.get('position_active', False))
+                ex_name = p.get('exchange', key.split(':')[0].lower() if ':' in key else 'binance')
+                sym = p.get('symbol', key.split(':')[1] if ':' in key else key)
                 entry_p = float(p.get('entry_price', 0.0))
                 t_stop = float(p.get('trailing_stop', 0.0))
                 buf = float(p.get('stop_loss_distance', 0.0))
@@ -238,7 +267,10 @@ def load_state():
                 if tp <= 0.0 and is_active and entry_p > 0:
                     tp = entry_p + (buf * RR_RATIO)
 
-                positions[sym] = {
+                composite_key = f"{ex_name.upper()}:{sym}"
+                positions[composite_key] = {
+                    "exchange": ex_name.lower(),
+                    "symbol": sym,
                     "position_active": is_active,
                     "entry_price": entry_p,
                     "trailing_stop": t_stop,
@@ -254,9 +286,9 @@ def load_state():
         print(f"♻️ Recovered State (last_updated={state.get('last_updated')})")
         if PAPER_TRADING:
             print(f"   ↳ [PAPER] Virtual Balance: ${virtual_balance_usdt:.2f} USDT")
-        for sym, p in positions.items():
+        for k, p in positions.items():
             if p["position_active"]:
-                print(f"   ↳ [{sym}] ACTIVE | Entry: {p['entry_price']:.2f} | Stop: {p['trailing_stop']:.2f} | TP: {p['take_profit']:.2f} | Lev: {p['leverage']}x")
+                print(f"   ↳ [{k}] ACTIVE | Entry: {p['entry_price']:.2f} | Stop: {p['trailing_stop']:.2f} | TP: {p['take_profit']:.2f} | Lev: {p['leverage']}x")
 
     except Exception as e:
         msg = f"💥 Corrupt state format encountered during recovery: {e}"
@@ -271,50 +303,52 @@ def reconcile_state_with_exchange():
     global positions
 
     if PAPER_TRADING:
-        print("📄 Paper Trading Mode active: Real exchange reconciliation bypassed.")
-        with state_lock:
-            for sym, p in positions.items():
-                if p["position_active"]:
-                    print(f"   ↳ Active Virtual Position: [{sym}] | Entry: ${p['entry_price']:.2f}")
+        print("📄 Paper Trading Mode: Real exchange balance reconciliation bypassed.")
         return True
 
     try:
-        balances = exchange.fetch_balance()
         dirty = False
-
         with state_lock:
-            active_symbols = [sym for sym, p in positions.items() if p["position_active"]]
+            active_keys = [k for k, p in positions.items() if p.get("position_active", False)]
 
-        for sym in active_symbols:
+        for key in active_keys:
+            pos = positions[key]
+            ex_name = pos["exchange"]
+            sym = pos["symbol"]
+            expected_units = pos["units"]
             base_asset = sym.split('/')[0]
-            with state_lock:
-                expected_units = positions[sym]["units"]
+
+            if ex_name not in exchanges:
+                continue
+
+            client = exchanges[ex_name]
+            balances = client.fetch_balance()
 
             base_balance = (
                 balances['free'].get(base_asset, 0.0)
                 + balances.get('used', {}).get(base_asset, 0.0)
             )
-            threshold = expected_units * 0.9 if expected_units > 0 else 0.0001
+            threshold = expected_units * 0.8 if expected_units > 0 else 0.0001
             holds_asset = base_balance >= threshold
 
-            print(f"🔎 Startup reconciliation [{sym}] | balance={base_balance:.8f}")
+            print(f"🔎 Startup reconciliation [{key}] on {ex_name.upper()} | Balance: {base_balance:.8f}")
 
             if not holds_asset:
-                msg = f"⚠️ *STATE MISMATCH* [{sym}]: Position recorded open but balance missing ({base_balance:.8f}). Flushing."
+                msg = f"⚠️ *STATE MISMATCH* [{key}]: Position recorded open but {base_asset} balance missing. Flushing stale record."
                 print(msg)
                 send_telegram_notification(msg)
                 with state_lock:
-                    positions[sym]["position_active"] = False
+                    positions[key]["position_active"] = False
                 dirty = True
 
         if dirty:
             save_state()
 
-        print("✅ Startup reconciliation completed.")
+        print("✅ Startup reconciliation completed across all active venues.")
         return True
 
     except Exception as e:
-        msg = f"❌ Startup reconciliation failed: {e}"
+        msg = f"❌ Multi-exchange startup reconciliation failed: {e}"
         print(msg)
         send_telegram_notification(msg)
         raise RuntimeError(msg) from e
@@ -326,7 +360,8 @@ def send_telegram_notification(message):
     if not ENABLE_TELEGRAM:
         return
     try:
-        prefix = "📝 *[PAPER SCANNER]* " if PAPER_TRADING else "⚡ *[LIVE SCANNER]* "
+        mode_tag = "PAPER" if PAPER_TRADING else ("BINANCE TESTNET / KRAKEN" if BINANCE_TESTNET else "LIVE CAPITAL")
+        prefix = f"⚡ *[DUAL-EXCHANGE // {mode_tag}]* "
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         payload = {
             "chat_id": TELEGRAM_CHAT_ID,
@@ -338,10 +373,11 @@ def send_telegram_notification(message):
     except Exception as e:
         print(f"⚠️ Telegram Alert Failed: {e}")
 
-def log_trade_to_ledger(timestamp, symbol, order_id, side, regime, price, amount, stop_loss, take_profit, leverage, status):
+def log_trade_to_ledger(timestamp, exchange_name, symbol, order_id, side, regime, price, amount, stop_loss, take_profit, leverage, status):
     trade_record = {
         'Timestamp': timestamp,
-        'Mode': 'PAPER' if PAPER_TRADING else 'LIVE',
+        'Exchange': exchange_name.upper(),
+        'Mode': 'PAPER' if PAPER_TRADING else 'LIVE_TESTNET',
         'Symbol': symbol,
         'OrderID': str(order_id),
         'Side': side,
@@ -356,7 +392,7 @@ def log_trade_to_ledger(timestamp, symbol, order_id, side, regime, price, amount
 
     try:
         upstash_command(["RPUSH", REDIS_LEDGER_KEY, json.dumps(trade_record)])
-        print(f"🌐 Trade logged to Upstash list '{REDIS_LEDGER_KEY}' [{symbol}]")
+        print(f"🌐 Trade logged to Upstash list '{REDIS_LEDGER_KEY}' [{exchange_name.upper()}:{symbol}]")
     except Exception as e:
         err_msg = f"⚠️ Failed to push trade to Upstash ledger: {e}"
         print(err_msg)
@@ -368,7 +404,7 @@ def log_trade_to_ledger(timestamp, symbol, order_id, side, regime, price, amount
             df_new.to_csv(CSV_FILE_PATH, index=False)
         else:
             df_new.to_csv(CSV_FILE_PATH, mode='a', header=False, index=False)
-        print(f"🗒 Trade logged locally to '{CSV_FILE_PATH}' [{symbol}]")
+        print(f"🗒 Trade logged locally: '{CSV_FILE_PATH}' [{exchange_name.upper()}:{symbol}]")
     except Exception as e:
         print(f"⚠️ Failed to write local trade CSV: {e}")
 
@@ -415,7 +451,7 @@ def check_news_safety(symbol):
         return True, f"NEWS_CHECK_BYPASS ({e})"
 
 # =====================================================================
-# 8. HARDENED SAFETY LAYER & PRE-FLIGHT BALANCES
+# 8. PRE-FLIGHT BALANCES & SAFETY LAYER
 # =====================================================================
 def check_safety_preflight():
     global consecutive_failures, virtual_balance_usdt
@@ -431,22 +467,19 @@ def check_safety_preflight():
             raise SystemExit(msg)
         return True
 
+    # Multi-exchange real/testnet balance checks
     try:
-        balances = exchange.fetch_balance()
-        quote_balance = balances['free'].get(SCAN_QUOTE_CURRENCY, 0.0)
-
-        if quote_balance < MIN_BALANCE_USDT:
-            msg = f"❌ *EMERGENCY SHUTDOWN*: Free {SCAN_QUOTE_CURRENCY} balance ({quote_balance:.2f}) fell below floor ({MIN_BALANCE_USDT:.2f})!"
-            send_telegram_notification(msg)
-            raise SystemExit(msg)
+        for ex_name, client in exchanges.items():
+            bal = client.fetch_balance()
+            quote_balance = bal['free'].get(SCAN_QUOTE_CURRENCY, 0.0)
+            if quote_balance < MIN_BALANCE_USDT:
+                print(f"⚠️ Low {SCAN_QUOTE_CURRENCY} balance on {ex_name.upper()}: {quote_balance:.2f} (Floor: {MIN_BALANCE_USDT:.2f})")
 
         with state_lock:
             consecutive_failures = 0
         save_state()
         return True
 
-    except SystemExit:
-        raise
     except Exception as e:
         with state_lock:
             consecutive_failures += 1
@@ -456,81 +489,79 @@ def check_safety_preflight():
         save_state()
 
         if failures >= MAX_FAILURES_ALLOWED:
-            msg = f"💥 *CRITICAL FAULT*: {MAX_FAILURES_ALLOWED} consecutive API failures. Script halted to defend capital."
+            msg = f"💥 *CRITICAL FAULT*: {MAX_FAILURES_ALLOWED} consecutive API failures across venues. Script halted."
             send_telegram_notification(msg)
             raise SystemExit(msg)
         return False
 
 # =====================================================================
-# 9. DYNAMIC MARKET DISCOVERY SCANNER (ALL-MARKET UNIVERSE)
+# 9. DUAL-VENUE MARKET DISCOVERY SCANNER
 # =====================================================================
-def discover_market_universe():
-    """
-    Scans entire Kraken spot exchange. Filters liquid active pairs by target quote currency,
-    sorting descending by 24h volume to construct the active candidate universe.
-    """
+def discover_all_markets():
     global active_candidate_universe
 
-    if TRADING_SYMBOLS_MODE.upper() != "AUTO":
-        candidates = [s.strip() for s in TRADING_SYMBOLS_MODE.split(",") if s.strip()]
-        with state_lock:
-            active_candidate_universe = candidates
-        return candidates
+    universe = {}
 
-    try:
-        print(f"🌐 [SCANNER] Fetching 24h ticker metrics across Kraken for {SCAN_QUOTE_CURRENCY} pairs...")
-        tickers = exchange.fetch_tickers()
-        valid_pairs = []
+    for ex_name, client in exchanges.items():
+        if TRADING_SYMBOLS_MODE.upper() != "AUTO":
+            pairs = [s.strip() for s in TRADING_SYMBOLS_MODE.split(",") if s.strip()]
+            universe[ex_name] = pairs
+            continue
 
-        for symbol, ticker in tickers.items():
-            if not symbol.endswith(f"/{SCAN_QUOTE_CURRENCY}"):
-                continue
-            # Exclude leveraged tokens or stablecoin pairs
-            base = symbol.split('/')[0]
-            if base in ['USDC', 'DAI', 'FDUSD', 'EURT', 'PYUSD', 'TUSD', 'UST']:
-                continue
+        try:
+            is_testnet = (ex_name == 'binance' and BINANCE_TESTNET)
+            min_volume_threshold = 0.0 if is_testnet else 50000.0
 
-            quote_volume = ticker.get('quoteVolume')
-            if quote_volume is None:
-                quote_volume = (ticker.get('baseVolume') or 0.0) * (ticker.get('last') or 0.0)
+            tickers = client.fetch_tickers()
+            valid_pairs = []
 
-            if quote_volume and quote_volume > 50000.0:  # Minimum 24h volume threshold ($50k)
-                valid_pairs.append({
-                    'symbol': symbol,
-                    'volume': quote_volume,
-                    'price': ticker.get('last') or 0.0
-                })
+            for symbol, ticker in tickers.items():
+                if not symbol.endswith(f"/{SCAN_QUOTE_CURRENCY}"):
+                    continue
 
-        valid_pairs.sort(key=lambda x: x['volume'], reverse=True)
-        selected_universe = [item['symbol'] for item in valid_pairs[:SCAN_TOP_LIQUID_PAIRS]]
+                base = symbol.split('/')[0]
+                if base in ['USDC', 'DAI', 'FDUSD', 'EURT', 'PYUSD', 'TUSD', 'UST', 'BUSD', 'EUR', 'GBP']:
+                    continue
+                if 'UP/' in symbol or 'DOWN/' in symbol or 'BEAR/' in symbol or 'BULL/' in symbol:
+                    continue
 
-        if not selected_universe:
-            # Fallback default if market fetch is degraded
-            selected_universe = [f'BTC/{SCAN_QUOTE_CURRENCY}', f'ETH/{SCAN_QUOTE_CURRENCY}', f'SOL/{SCAN_QUOTE_CURRENCY}']
+                quote_vol = ticker.get('quoteVolume')
+                if quote_vol is None:
+                    quote_vol = (ticker.get('baseVolume') or 0.0) * (ticker.get('last') or 0.0)
 
-        with state_lock:
-            active_candidate_universe = selected_universe
+                if quote_vol is not None and quote_vol >= min_volume_threshold:
+                    valid_pairs.append({
+                        'symbol': symbol,
+                        'volume': quote_vol,
+                        'price': ticker.get('last') or 0.0
+                    })
 
-        print(f"🎯 [SCANNER] Discovered {len(selected_universe)} top-liquid candidate markets: {', '.join(selected_universe[:6])}...")
-        return selected_universe
+            valid_pairs.sort(key=lambda x: x['volume'], reverse=True)
+            top_pairs = [item['symbol'] for item in valid_pairs[:SCAN_TOP_LIQUID_PAIRS]]
 
-    except Exception as e:
-        print(f"⚠️ [SCANNER] Universe discovery failed: {e}. Retaining prior watchlist.")
-        with state_lock:
-            if not active_candidate_universe:
-                active_candidate_universe = [f'BTC/{SCAN_QUOTE_CURRENCY}', f'ETH/{SCAN_QUOTE_CURRENCY}', f'SOL/{SCAN_QUOTE_CURRENCY}']
-            return list(active_candidate_universe)
+            if not top_pairs:
+                top_pairs = [f'BTC/{SCAN_QUOTE_CURRENCY}', f'ETH/{SCAN_QUOTE_CURRENCY}', f'SOL/{SCAN_QUOTE_CURRENCY}']
+
+            universe[ex_name] = top_pairs
+
+        except Exception as e:
+            print(f"⚠️ Discovery warning for {ex_name.upper()}: {e}")
+            universe[ex_name] = [f'BTC/{SCAN_QUOTE_CURRENCY}', f'ETH/{SCAN_QUOTE_CURRENCY}']
+
+    with state_lock:
+        active_candidate_universe = universe
+
+    total_markets = sum(len(v) for v in universe.values())
+    print(f"🎯 [DUAL SCANNER] Discovered {total_markets} active candidates across {list(universe.keys())}")
+    return universe
 
 # =====================================================================
 # 10. TECHNICAL INDICATOR ENGINE & OPPORTUNITY SCORER
 # =====================================================================
-def analyze_advanced_market(symbol):
+def analyze_market_pair(client, symbol):
     try:
-        bars = exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=100)
-        df = pd.DataFrame(
-            bars,
-            columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']
-        )
+        bars = client.fetch_ohlcv(symbol, TIMEFRAME, limit=100)
+        df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
 
         rolling_20 = df['close'].rolling(20)
         sma_20 = rolling_20.mean()
@@ -567,7 +598,6 @@ def analyze_advanced_market(symbol):
         dx = (100.0 * (plus_di - minus_di).abs() / di_sum.replace(0.0, float('nan'))).fillna(0.0)
         adx_series = dx.ewm(alpha=1.0/14.0, adjust=False).mean()
 
-        # Volume momentum surge ratio
         vol_sma_20 = df['volume'].rolling(20).mean()
         volume_surge = float(df['volume'].iloc[-1] / (vol_sma_20.iloc[-1] + 1e-6))
 
@@ -580,15 +610,10 @@ def analyze_advanced_market(symbol):
             'bb_upper': float(bb_upper.iloc[-1]),
             'vol_surge': volume_surge
         }
-    except Exception as e:
+    except Exception:
         return None
 
 def score_trading_opportunity(symbol, metrics):
-    """
-    Multi-factor Opportunity Scorer. Returns:
-    - regime: 'SIDEWAYS', 'SWING', or 'NONE'
-    - score: 0.00 to 1.00 ranking priority
-    """
     current_price = metrics['close']
     atr = metrics['atr']
     adx = metrics['adx']
@@ -619,15 +644,15 @@ def score_trading_opportunity(symbol, metrics):
     return "NONE", 0.0
 
 # =====================================================================
-# 11. ADAPTIVE LEVERAGE & RISK SIZING CALCULATOR
+# 11. ADAPTIVE LEVERAGE & DYNAMIC POSITION SIZING
 # =====================================================================
-def calculate_dynamic_entry(symbol, current_price, atr, regime, score):
+def calculate_dynamic_entry(client, ex_name, symbol, current_price, atr, regime, score):
     with state_lock:
         if PAPER_TRADING:
             equity = virtual_balance_usdt
         else:
             try:
-                bal = exchange.fetch_balance()
+                bal = client.fetch_balance()
                 equity = float(bal['free'].get(SCAN_QUOTE_CURRENCY, 0.0) + bal.get('used', {}).get(SCAN_QUOTE_CURRENCY, 0.0))
             except Exception:
                 equity = 100.0
@@ -640,7 +665,18 @@ def calculate_dynamic_entry(symbol, current_price, atr, regime, score):
     calculated_stop = current_price - stop_distance
     take_profit = current_price + (stop_distance * RR_RATIO)
 
-    units = dollar_risk / stop_distance
+    raw_units = dollar_risk / stop_distance
+
+    # Binance Min-Notional Rule ($10.5 minimum notional)
+    if ex_name == "binance" and (raw_units * current_price) < 10.5:
+        raw_units = 11.0 / current_price
+
+    # Precision formatting via CCXT
+    try:
+        units = float(client.amount_to_precision(symbol, raw_units))
+    except Exception:
+        units = round(raw_units, 4)
+
     notional_value = units * current_price
     margin_required = notional_value / leverage
 
@@ -653,14 +689,17 @@ def calculate_dynamic_entry(symbol, current_price, atr, regime, score):
         if available_margin_budget > 10.0:
             margin_required = available_margin_budget
             notional_value = margin_required * leverage
-            units = notional_value / current_price
+            try:
+                units = float(client.amount_to_precision(symbol, notional_value / current_price))
+            except Exception:
+                units = round(notional_value / current_price, 4)
         else:
             return None
 
     return {
         "confidence": score,
         "leverage": leverage,
-        "units": round(units, 6),
+        "units": units,
         "margin_required": round(margin_required, 2),
         "trailing_stop": round(calculated_stop, 2),
         "take_profit": round(take_profit, 2),
@@ -668,13 +707,15 @@ def calculate_dynamic_entry(symbol, current_price, atr, regime, score):
     }
 
 # =====================================================================
-# 12. ACTIVE POSITION MONITOR & DISPATCHER
+# 12. ACTIVE POSITION GUARD ENGINE
 # =====================================================================
-def manage_active_position(symbol, current_price):
+def manage_active_position(key, current_price):
     global positions, virtual_balance_usdt
 
     with state_lock:
-        pos = positions[symbol]
+        pos = positions[key]
+        ex_name = pos["exchange"]
+        symbol = pos["symbol"]
         curr_entry = pos["entry_price"]
         curr_stop = pos["trailing_stop"]
         curr_tp = pos["take_profit"]
@@ -684,9 +725,9 @@ def manage_active_position(symbol, current_price):
         margin_allocated = pos["margin_allocated"]
         regime = pos["regime"]
 
-    mode_label = "PAPER" if PAPER_TRADING else "LIVE"
+    mode_label = "PAPER" if PAPER_TRADING else ("TESTNET" if (ex_name == 'binance' and BINANCE_TESTNET) else "LIVE")
     print(
-        f"🛡️ [{mode_label} | {symbol}] {regime} | Entry: {curr_entry:.2f} | Current: {current_price:.2f} | "
+        f"🛡️ [{key} | {mode_label}] {regime} | Entry: {curr_entry:.2f} | Current: {current_price:.2f} | "
         f"SL: {curr_stop:.2f} | TP: {curr_tp:.2f} | Lev: {leverage}x"
     )
 
@@ -701,7 +742,7 @@ def manage_active_position(symbol, current_price):
         exit_type = "TAKE_PROFIT_LIMIT"
 
     if exit_triggered:
-        print(f"🚨 [{symbol}] {exit_type} TRIGGERED at {current_price:.2f}!")
+        print(f"🚨 [{key}] {exit_type} TRIGGERED at {current_price:.2f}!")
         try:
             timestamp = utc_now_iso()
             pnl = (current_price - curr_entry) * units
@@ -710,16 +751,18 @@ def manage_active_position(symbol, current_price):
                 order_id = f"SIM_{exit_type[:4]}_{int(time.time() * 1000)}"
                 with state_lock:
                     virtual_balance_usdt += (margin_allocated + pnl)
-                print(f"📝 [PAPER] Exit filled at ${current_price:.2f}. PnL: ${pnl:+.2f} USDT. Balance: ${virtual_balance_usdt:.2f}")
+                print(f"📝 [{key} PAPER] Exit filled at ${current_price:.2f}. PnL: ${pnl:+.2f}. New Balance: ${virtual_balance_usdt:.2f}")
             else:
+                client = exchanges[ex_name]
                 params = {}
-                if leverage > 1.0:
+                if leverage > 1.0 and ex_name == "kraken":
                     params['leverage'] = int(leverage)
-                order = exchange.create_market_sell_order(symbol, units, params)
+                order = client.create_market_sell_order(symbol, units, params)
                 order_id = order.get('id', 'UNKNOWN_ID')
 
             msg = (
-                f"🚨 *POSITION CLOSED* [{symbol}]\n"
+                f"🚨 *POSITION CLOSED* [{key}]\n"
+                f"Venue: `{ex_name.upper()}`\n"
                 f"Reason: `{exit_type}`\n"
                 f"Exit Price: `{current_price:.2f}`\n"
                 f"PnL: `{pnl:+.2f} {SCAN_QUOTE_CURRENCY}`\n"
@@ -727,39 +770,46 @@ def manage_active_position(symbol, current_price):
             )
             send_telegram_notification(msg)
             log_trade_to_ledger(
-                timestamp, symbol, order_id, 'SELL', regime,
+                timestamp, ex_name, symbol, order_id, 'SELL', regime,
                 current_price, units, curr_stop, curr_tp, leverage, exit_type
             )
 
             with state_lock:
-                positions[symbol]["position_active"] = False
+                positions[key]["position_active"] = False
             save_state()
 
         except Exception as e:
-            print(f"❌ [{symbol}] Exit order failure: {e}")
-            send_telegram_notification(f"❌ CRITICAL [{symbol}]: Exit order failed: {e}")
+            print(f"❌ [{key}] Exit order failure: {e}")
+            send_telegram_notification(f"❌ CRITICAL [{key}]: Exit order failed: {e}")
 
     elif current_price > curr_entry:
         new_stop = current_price - risk_dist
         if new_stop > curr_stop:
             with state_lock:
-                positions[symbol]["trailing_stop"] = new_stop
-            print(f"📈 [{symbol}] Trailing Stop ratcheted to: {new_stop:.2f}")
+                positions[key]["trailing_stop"] = new_stop
+            print(f"📈 [{key}] Trailing Stop ratcheted to: {new_stop:.2f}")
             save_state()
 
+# =====================================================================
+# 13. MASTER DUAL-EXCHANGE EXECUTION ORCHESTRATOR
+# =====================================================================
 def execution_orchestrator():
     global positions, virtual_balance_usdt, top_scanned_opportunities
 
     safety_ok = check_safety_preflight()
 
-    # Step 1: Manage Active Positions
+    # Step 1: Manage Active Positions across all exchanges
     with state_lock:
-        active_symbols = [sym for sym, p in positions.items() if p.get("position_active", False)]
+        active_keys = [k for k, p in positions.items() if p.get("position_active", False)]
 
-    for symbol in active_symbols:
-        metrics = analyze_advanced_market(symbol)
-        if metrics:
-            manage_active_position(symbol, metrics['close'])
+    for key in active_keys:
+        pos = positions[key]
+        ex_name = pos["exchange"]
+        symbol = pos["symbol"]
+        if ex_name in exchanges:
+            metrics = analyze_market_pair(exchanges[ex_name], symbol)
+            if metrics:
+                manage_active_position(key, metrics['close'])
 
     if not safety_ok:
         return
@@ -770,78 +820,86 @@ def execution_orchestrator():
 
     free_slots = MAX_CONCURRENT_POSITIONS - current_open_count
     if free_slots <= 0:
-        print(f"⏸️ Max concurrent capacity engaged ({current_open_count}/{MAX_CONCURRENT_POSITIONS}). Scanning paused.")
+        print(f"⏸️ Max capacity engaged ({current_open_count}/{MAX_CONCURRENT_POSITIONS}). Scanning paused.")
         return
 
-    # Step 3: Run Scanner Across the Full Market Universe
-    candidate_pool = discover_market_universe()
-    update_engine_status(scanner_status=f"SCANNING {len(candidate_pool)} PAIRS")
+    # Step 3: Run Discovery and Scanning across both venues
+    universe_by_exchange = discover_all_markets()
+    total_pairs = sum(len(pairs) for pairs in universe_by_exchange.values())
+    update_engine_status(scanner_status=f"SCANNING {total_pairs} PAIRS ACROSS VENUES")
 
     scored_candidates = []
 
-    for symbol in candidate_pool:
-        # Don't re-enter if already active
-        with state_lock:
-            if positions.get(symbol, {}).get("position_active", False):
+    for ex_name, pair_list in universe_by_exchange.items():
+        client = exchanges[ex_name]
+
+        for symbol in pair_list:
+            composite_key = f"{ex_name.upper()}:{symbol}"
+
+            with state_lock:
+                if positions.get(composite_key, {}).get("position_active", False):
+                    continue
+
+            metrics = analyze_market_pair(client, symbol)
+            if not metrics:
                 continue
 
-        metrics = analyze_advanced_market(symbol)
-        if not metrics:
-            continue
+            regime, score = score_trading_opportunity(symbol, metrics)
 
-        regime, score = score_trading_opportunity(symbol, metrics)
+            if score > 0.0:
+                scored_candidates.append({
+                    'exchange': ex_name,
+                    'symbol': symbol,
+                    'composite_key': composite_key,
+                    'regime': regime,
+                    'score': score,
+                    'price': metrics['close'],
+                    'atr': metrics['atr'],
+                    'adx': metrics['adx'],
+                    'rsi': metrics['rsi'],
+                    'metrics': metrics
+                })
 
-        if score > 0.0:
-            scored_candidates.append({
-                'symbol': symbol,
-                'regime': regime,
-                'score': score,
-                'price': metrics['close'],
-                'atr': metrics['atr'],
-                'adx': metrics['adx'],
-                'rsi': metrics['rsi'],
-                'metrics': metrics
-            })
-
-    # Sort descending by opportunity score
+    # Sort descending by score across BOTH exchanges
     scored_candidates.sort(key=lambda x: x['score'], reverse=True)
 
     with state_lock:
-        top_scanned_opportunities = scored_candidates[:8]
+        top_scanned_opportunities = scored_candidates[:10]
 
     update_engine_status(scanner_status=f"FOUND {len(scored_candidates)} SIGNALS")
 
     if not scored_candidates:
-        print(f"🔍 [SCANNER] Scanned {len(candidate_pool)} markets. No high-conviction setups met threshold.")
+        print(f"🔍 [DUAL SCANNER] Scanned {total_pairs} markets across Binance and Kraken. No valid setups met threshold.")
         return
 
-    # Step 4: Execute on Top-Ranked Opportunity
+    # Step 4: Execute on the Best Cross-Venue Opportunities
     for candidate in scored_candidates:
         if free_slots <= 0:
             break
 
+        ex_name = candidate['exchange']
         sym = candidate['symbol']
+        key = candidate['composite_key']
         regime = candidate['regime']
         score = candidate['score']
         price = candidate['price']
+        client = exchanges[ex_name]
 
-        print(f"🎯 Top Market Opportunity Selected: [{sym}] | Regime: {regime} | Opportunity Score: {score:.3f}")
+        print(f"🎯 Top Venue Setup Selected: [{key}] | Regime: {regime} | Score: {score:.3f}")
 
-        # News Safety Shield
         news_ok, news_msg = check_news_safety(sym)
-        update_engine_status(active_news_status=f"[{sym}]: {news_msg}")
+        update_engine_status(active_news_status=f"[{key}]: {news_msg}")
         if not news_ok:
-            print(f"🛑 Trade entry blocked by News Shield for {sym}: {news_msg}")
+            print(f"🛑 Trade entry blocked by News Shield for {key}: {news_msg}")
             continue
 
-        # Dynamic Risk Sizing & Adaptive Leverage
-        plan = calculate_dynamic_entry(sym, price, candidate['atr'], regime, score)
+        plan = calculate_dynamic_entry(client, ex_name, sym, price, candidate['atr'], regime, score)
         if not plan:
-            print(f"⚠️ Sizing rejected: Insufficient portfolio margin allowance for {sym}.")
+            print(f"⚠️ Sizing rejected: Insufficient portfolio margin allowance for {key}.")
             continue
 
         print(
-            f"⚡ Executing {regime} Entry [{sym}] | Price: {price:.2f} | Units: {plan['units']} | "
+            f"⚡ Executing {regime} Entry [{key}] | Price: {price:.2f} | Units: {plan['units']} | "
             f"Margin: ${plan['margin_required']} | Lev: {plan['leverage']}x | Score: {score:.3f}"
         )
 
@@ -851,16 +909,18 @@ def execution_orchestrator():
                 order_id = f"SIM_BUY_{int(time.time() * 1000)}"
                 with state_lock:
                     virtual_balance_usdt -= plan['margin_required']
-                print(f"📝 [PAPER] Virtual entry filled on {sym}. Margin reserved: ${plan['margin_required']:.2f}")
+                print(f"📝 [{key} PAPER] Virtual entry filled. Margin: ${plan['margin_required']:.2f}")
             else:
                 params = {}
-                if plan['leverage'] > 1.0:
+                if plan['leverage'] > 1.0 and ex_name == "kraken":
                     params['leverage'] = int(plan['leverage'])
-                order = exchange.create_market_buy_order(sym, plan['units'], params)
+                order = client.create_market_buy_order(sym, plan['units'], params)
                 order_id = order.get('id', 'UNKNOWN_ID')
 
             with state_lock:
-                positions[sym] = {
+                positions[key] = {
+                    "exchange": ex_name,
+                    "symbol": sym,
                     "position_active": True,
                     "entry_price": price,
                     "trailing_stop": plan['trailing_stop'],
@@ -875,8 +935,8 @@ def execution_orchestrator():
             save_state()
 
             msg = (
-                f"🟢 *MARKET SCANNER ENTRY ({regime})*\n"
-                f"Symbol: `{sym}`\n"
+                f"🟢 *{ex_name.upper()} SCANNER ENTRY ({regime})*\n"
+                f"Market: `{key}`\n"
                 f"Opportunity Score: `{score:.3f}`\n"
                 f"Entry Price: `{price:.2f}`\n"
                 f"Size: `{plan['units']}` (${plan['margin_required'] * plan['leverage']:.2f} Notional)\n"
@@ -886,18 +946,18 @@ def execution_orchestrator():
             )
             send_telegram_notification(msg)
             log_trade_to_ledger(
-                timestamp, sym, order_id, 'BUY', regime,
+                timestamp, ex_name, sym, order_id, 'BUY', regime,
                 price, plan['units'], plan['trailing_stop'], plan['take_profit'], plan['leverage'], 'POSITION_OPEN'
             )
 
             free_slots -= 1
 
         except Exception as e:
-            print(f"❌ Entry order failed [{sym}]: {e}")
-            send_telegram_notification(f"❌ Entry blocked [{sym}]: {e}")
+            print(f"❌ Entry order failed [{key}]: {e}")
+            send_telegram_notification(f"❌ Entry blocked [{key}]: {e}")
 
 # =====================================================================
-# 13. BACKGROUND TRADING ENGINE DAEMON
+# 14. BACKGROUND TRADING DAEMON
 # =====================================================================
 def trading_engine_loop():
     update_engine_status(
@@ -910,7 +970,15 @@ def trading_engine_loop():
     )
 
     try:
-        print("♻️ Loading multi-pair margin state from Upstash...")
+        # Load exchange markets for precision calculations
+        for ex_name, client in exchanges.items():
+            try:
+                client.load_markets()
+                print(f"📦 Loaded {len(client.markets)} markets from {ex_name.upper()}.")
+            except Exception as mex:
+                print(f"⚠️ Market loading warning on {ex_name.upper()}: {mex}")
+
+        print("♻️ Loading multi-venue state from Upstash...")
         load_state()
 
         print("🔎 Performing startup reconciliation...")
@@ -921,9 +989,9 @@ def trading_engine_loop():
             engine_state="RUNNING"
         )
 
-        mode_str = "PAPER TRADING" if PAPER_TRADING else "LIVE CAPITAL"
-        print(f"🚀 Quantum All-Market Scanner Active [{mode_str}]. Mode: {TRADING_SYMBOLS_MODE}")
-        send_telegram_notification(f"🚀 Kraken All-Market Scanner Engaged [{mode_str}]!")
+        mode_str = "PAPER TRADING" if PAPER_TRADING else ("BINANCE TESTNET // KRAKEN" if BINANCE_TESTNET else "LIVE CAPITAL")
+        print(f"🚀 Dual-Exchange Quantum Scanner Active [{mode_str}]. Venues: {list(exchanges.keys())}")
+        send_telegram_notification(f"🚀 Dual-Exchange Engine Engaged [{mode_str}] on Binance & Kraken!")
 
         while True:
             update_engine_status(
@@ -989,7 +1057,7 @@ def trading_engine_loop():
         print("ℹ️ Trading thread stopped. Web server remains active for diagnostics.")
 
 # =====================================================================
-# 14. OPERATOR TERMINAL UI (WITH LIVE SCANNER MATRIX)
+# 15. OPERATOR TERMINAL UI (MULTI-VENUE DASHBOARD)
 # =====================================================================
 app = Flask(__name__)
 
@@ -999,7 +1067,7 @@ DASHBOARD_HTML = """
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-  <title>Kraken All-Market Scanner Terminal</title>
+  <title>Institutional Multi-Exchange Terminal</title>
   <style>
     :root {
       --bg: #090d16;
@@ -1057,7 +1125,9 @@ DASHBOARD_HTML = """
     .badge-running { background: var(--green-glow); color: var(--green); border: 1px solid var(--green); }
     .badge-halted { background: var(--red-glow); color: var(--red); border: 1px solid var(--red); }
     .badge-paper { background: var(--amber-glow); color: var(--amber); border: 1px solid var(--amber); }
+    .badge-testnet { background: rgba(88, 166, 255, 0.15); color: var(--blue); border: 1px solid var(--blue); }
     .badge-live { background: var(--green-glow); color: var(--green); border: 1px solid var(--green); }
+    .badge-venue { background: #1a2233; color: var(--text); border: 1px solid var(--border); }
     .dot {
       width: 7px;
       height: 7px;
@@ -1124,6 +1194,15 @@ DASHBOARD_HTML = """
     }
     tr:last-child td { border-bottom: none; }
     .score-high { color: var(--green); font-weight: 700; }
+    .venue-tag {
+      font-size: 10px;
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+    .venue-binance { background: rgba(240, 185, 11, 0.15); color: #f0b90b; border: 1px solid #f0b90b; }
+    .venue-kraken { background: rgba(87, 65, 217, 0.15); color: #9c88ff; border: 1px solid #9c88ff; }
     .raw-box {
       background: #05080f;
       border: 1px solid var(--border);
@@ -1148,8 +1227,9 @@ DASHBOARD_HTML = """
 <body>
   <div class="header">
     <div class="title">
-      <span>KRAKEN ALL-MARKET SCANNER</span>
-      <span id="badge-mode" class="badge badge-paper"><span class="dot"></span>PAPER</span>
+      <span>DUAL QUANT TERMINAL</span>
+      <span class="badge badge-venue">BINANCE + KRAKEN</span>
+      <span id="badge-mode" class="badge badge-testnet"><span class="dot"></span>MODE</span>
       <span id="badge-state" class="badge badge-running"><span class="dot"></span>RUNNING</span>
     </div>
     <div style="font-size: 12px; color: var(--muted);" id="last-updated">--:--:--</div>
@@ -1157,8 +1237,8 @@ DASHBOARD_HTML = """
 
   <div class="grid">
     <div class="card">
-      <div class="card-label">Virtual Capital</div>
-      <div class="card-value" id="val-balance">$0.00</div>
+      <div class="card-label">Execution Mode</div>
+      <div class="card-value" id="val-mode" style="font-size: 16px; margin-top: 4px;">SYNCING</div>
     </div>
     <div class="card">
       <div class="card-label">Scanner Status</div>
@@ -1166,19 +1246,20 @@ DASHBOARD_HTML = """
     </div>
     <div class="card">
       <div class="card-label">Active Positions</div>
-      <div class="card-value" id="val-positions">0 / 2</div>
+      <div class="card-value" id="val-positions">0 / 3</div>
     </div>
     <div class="card">
-      <div class="card-label">News Shield</div>
+      <div class="card-label">News Safety Shield</div>
       <div class="card-value" id="val-news" style="font-size: 14px; margin-top: 4px;">MONITORING</div>
     </div>
   </div>
 
-  <div class="section-title">Active Live Positions</div>
+  <div class="section-title">Active Positions Across Venues</div>
   <div class="table-container">
     <table>
       <thead>
         <tr>
+          <th>Venue</th>
           <th>Symbol</th>
           <th>Regime</th>
           <th>Leverage</th>
@@ -1190,16 +1271,17 @@ DASHBOARD_HTML = """
         </tr>
       </thead>
       <tbody id="active-positions-tbody">
-        <tr><td colspan="8" style="color: var(--muted); text-align: center;">No open positions. Scanner is seeking opportunities.</td></tr>
+        <tr><td colspan="9" style="color: var(--muted); text-align: center;">No open positions. Dual scanner evaluating candidate markets.</td></tr>
       </tbody>
     </table>
   </div>
 
-  <div class="section-title">Top Scanned Market Opportunities (Neural Ranked)</div>
+  <div class="section-title">Cross-Exchange Top Opportunities (Ranked by Score)</div>
   <div class="table-container">
     <table>
       <thead>
         <tr>
+          <th>Venue</th>
           <th>Market</th>
           <th>Regime</th>
           <th>Opportunity Score</th>
@@ -1209,12 +1291,12 @@ DASHBOARD_HTML = """
         </tr>
       </thead>
       <tbody id="opportunities-tbody">
-        <tr><td colspan="6" style="color: var(--muted); text-align: center;">Evaluating market opportunities across Kraken...</td></tr>
+        <tr><td colspan="7" style="color: var(--muted); text-align: center;">Scanning candidate markets across Binance & Kraken...</td></tr>
       </tbody>
     </table>
   </div>
 
-  <div class="section-title">Raw Engine Telemetry Snapshot</div>
+  <div class="section-title">Raw Engine Telemetry Diagnostics</div>
   <pre class="raw-box" id="raw-state">Fetching telemetrics...</pre>
 
   <div class="footer">
@@ -1229,19 +1311,23 @@ DASHBOARD_HTML = """
         const data = await res.json();
 
         const badgeMode = document.getElementById('badge-mode');
-        badgeMode.textContent = data.mode === 'PAPER_TRADING' ? 'PAPER SIMULATION' : 'LIVE CAPITAL';
-        badgeMode.className = 'badge ' + (data.mode === 'PAPER_TRADING' ? 'badge-paper' : 'badge-live');
+        if (data.mode === 'PAPER_TRADING') {
+          badgeMode.textContent = 'PAPER SIMULATION';
+          badgeMode.className = 'badge badge-paper';
+          document.getElementById('val-mode').textContent = 'PAPER SIMULATION';
+        } else {
+          badgeMode.textContent = 'BINANCE TESTNET / KRAKEN';
+          badgeMode.className = 'badge badge-testnet';
+          document.getElementById('val-mode').textContent = 'DEMO TESTNET & LIVE';
+        }
 
         const badgeState = document.getElementById('badge-state');
         badgeState.textContent = data.engine_state;
         badgeState.className = 'badge ' + (data.engine_state === 'RUNNING' ? 'badge-running' : 'badge-halted');
 
         document.getElementById('last-updated').textContent = new Date().toLocaleTimeString();
-
-        const bal = data.virtual_balance_usdt !== null ? '$' + Number(data.virtual_balance_usdt).toFixed(2) : 'LIVE ACCOUNT';
-        document.getElementById('val-balance').textContent = bal;
         document.getElementById('val-scanner').textContent = data.scanner_status || 'SCANNING';
-        document.getElementById('val-positions').textContent = Object.keys(data.positions || {}).length + ' / 2 Cap';
+        document.getElementById('val-positions').textContent = Object.keys(data.positions || {}).length + ' / 3 Cap';
         document.getElementById('val-news').textContent = data.active_news_status || 'MONITORING';
 
         // 1. Active Positions Table
@@ -1249,12 +1335,15 @@ DASHBOARD_HTML = """
         actBody.innerHTML = '';
         const posEntries = Object.entries(data.positions || {});
         if (posEntries.length === 0) {
-          actBody.innerHTML = '<tr><td colspan="8" style="color: var(--muted); text-align: center;">No open positions. Scanner is seeking setups.</td></tr>';
+          actBody.innerHTML = '<tr><td colspan="9" style="color: var(--muted); text-align: center;">No open positions. Dual scanner seeking setups.</td></tr>';
         } else {
-          for (const [sym, pos] of posEntries) {
+          for (const [key, pos] of posEntries) {
+            const exName = pos.exchange || 'binance';
+            const exClass = exName === 'binance' ? 'venue-binance' : 'venue-kraken';
             const row = document.createElement('tr');
             row.innerHTML = `
-              <td><strong>${sym}</strong></td>
+              <td><span class="venue-tag ${exClass}">${exName}</span></td>
+              <td><strong>${pos.symbol}</strong></td>
               <td>${pos.regime}</td>
               <td>${pos.leverage}x</td>
               <td>${pos.units}</td>
@@ -1272,11 +1361,14 @@ DASHBOARD_HTML = """
         oppBody.innerHTML = '';
         const opps = data.top_opportunities || [];
         if (opps.length === 0) {
-          oppBody.innerHTML = '<tr><td colspan="6" style="color: var(--muted); text-align: center;">Scanning candidate markets...</td></tr>';
+          oppBody.innerHTML = '<tr><td colspan="7" style="color: var(--muted); text-align: center;">Evaluating candidate markets across venues...</td></tr>';
         } else {
           for (const item of opps) {
+            const exName = item.exchange || 'binance';
+            const exClass = exName === 'binance' ? 'venue-binance' : 'venue-kraken';
             const row = document.createElement('tr');
             row.innerHTML = `
+              <td><span class="venue-tag ${exClass}">${exName}</span></td>
               <td><strong>${item.symbol}</strong></td>
               <td>${item.regime}</td>
               <td class="score-high">${Number(item.score).toFixed(3)}</td>
@@ -1310,7 +1402,8 @@ def dashboard():
 def health():
     return jsonify({
         "status": "ok",
-        "service": "kraken-all-market-scanner",
+        "service": "dual-exchange-scanner",
+        "venues": [e.upper() for e in exchanges.keys()],
         "paper_trading": PAPER_TRADING,
         "timestamp": utc_now_iso()
     }), 200
@@ -1320,12 +1413,12 @@ def status():
     return jsonify(get_status_snapshot()), 200
 
 # =====================================================================
-# 15. APPLICATION BOOTSTRAP
+# 16. APPLICATION BOOTSTRAP
 # =====================================================================
 def start_trading_thread():
     active_threads = [
         t for t in threading.enumerate()
-        if t.name == "KrakenTradingEngine" and t.is_alive()
+        if t.name == "TradingEngine" and t.is_alive()
     ]
     if active_threads:
         print("⚠️ Trading engine thread already running. Skipping duplicate spawn.")
@@ -1333,16 +1426,15 @@ def start_trading_thread():
 
     engine_thread = threading.Thread(
         target=trading_engine_loop,
-        name="KrakenTradingEngine",
+        name="TradingEngine",
         daemon=True
     )
     engine_thread.start()
-    print("🧵 Quantum All-Market Scanner Engine thread started.")
+    print("🧵 Dual-Exchange Quantum Engine thread started.")
 
 if __name__ == "__main__":
-    print(f"🌐 Starting Kraken All-Market Scanner on 0.0.0.0:{SERVER_PORT}")
-    print(f"⚙️ Mode: {'PAPER TRADING (Simulated)' if PAPER_TRADING else 'LIVE CAPITAL'}")
-    print(f"🔍 Discovery Mode: {TRADING_SYMBOLS_MODE} ({SCAN_QUOTE_CURRENCY} pairs)")
+    print(f"🌐 Starting Dual-Exchange Web Service on 0.0.0.0:{SERVER_PORT}")
+    print(f"🏛️ Enabled Venues: {list(exchanges.keys())}")
     print("💻 Dashboard: /")
     print("📡 Health Check: /health")
     print("📊 Telemetry API: /status")

@@ -6,7 +6,6 @@ import traceback
 from datetime import datetime, timezone
 import ccxt
 import pandas as pd
-import pandas_ta as ta
 import requests
 from flask import Flask, jsonify
 
@@ -25,11 +24,9 @@ ENABLE_TELEGRAM = os.environ.get("ENABLE_TELEGRAM", "false").strip().lower() in 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
-# Comma-separated pairs: "BTC/USDT,ETH/USDT,SOL/USDT"
 SYMBOLS_RAW = os.environ.get("TRADING_SYMBOLS", "BTC/USDT").strip()
 SYMBOLS = [s.strip() for s in SYMBOLS_RAW.split(",") if s.strip()]
 
-# JSON map of per-symbol allocation: '{"BTC/USDT": 0.0005, "ETH/USDT": 0.01}'
 TRADE_AMOUNTS_RAW = os.environ.get("TRADE_AMOUNTS", '{"BTC/USDT": 0.0005}').strip()
 try:
     TRADE_AMOUNTS = json.loads(TRADE_AMOUNTS_RAW)
@@ -80,7 +77,6 @@ validate_environment()
 # =====================================================================
 state_lock = threading.Lock()
 
-# positions schema: { symbol: { position_active, entry_price, trailing_stop, stop_loss_distance } }
 positions = {}
 for s in SYMBOLS:
     positions[s] = {
@@ -410,10 +406,10 @@ def check_safety_preflight():
         return False
 
 # =====================================================================
-# 8. ENHANCED MARKET REGIME MATHEMATICS
+# 8. PURE PANDAS TECHNICAL INDICATOR ENGINE (ZERO-DEPENDENCY)
 # =====================================================================
 def analyze_advanced_market(symbol):
-    """Calculates ADX, Bollinger Bands, RSI, and ATR for a given symbol."""
+    """Calculates ADX, Bollinger Bands, RSI, and ATR natively using Pandas."""
     try:
         bars = exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=100)
         df = pd.DataFrame(
@@ -421,18 +417,52 @@ def analyze_advanced_market(symbol):
             columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']
         )
 
-        adx_df = ta.adx(df['high'], df['low'], df['close'], length=14)
-        bb_df = ta.bbands(df['close'], length=20, std=2)
-        rsi_series = ta.rsi(df['close'], length=14)
-        atr_series = ta.atr(df['high'], df['low'], df['close'], length=14)
+        # 1. Bollinger Bands (20, 2)
+        rolling_20 = df['close'].rolling(20)
+        sma_20 = rolling_20.mean()
+        std_20 = rolling_20.std()
+        bb_lower = sma_20 - (2.0 * std_20)
+        bb_upper = sma_20 + (2.0 * std_20)
+
+        # 2. RSI (14) via Wilder's Smoothing
+        delta = df['close'].diff()
+        gain = delta.clip(lower=0.0)
+        loss = (-delta).clip(lower=0.0)
+        avg_gain = gain.ewm(alpha=1.0/14.0, adjust=False).mean()
+        avg_loss = loss.ewm(alpha=1.0/14.0, adjust=False).mean()
+        rs = avg_gain / avg_loss.replace(0.0, float('nan'))
+        rsi_series = 100.0 - (100.0 / (1.0 + rs))
+
+        # 3. ATR (14) via Wilder's Smoothing
+        prev_close = df['close'].shift(1)
+        tr1 = df['high'] - df['low']
+        tr2 = (df['high'] - prev_close).abs()
+        tr3 = (df['low'] - prev_close).abs()
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        atr_series = tr.ewm(alpha=1.0/14.0, adjust=False).mean()
+
+        # 4. ADX (14)
+        up_move = df['high'].diff()
+        down_move = -df['low'].diff()
+        plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
+        minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
+
+        smooth_plus_dm = plus_dm.ewm(alpha=1.0/14.0, adjust=False).mean()
+        smooth_minus_dm = minus_dm.ewm(alpha=1.0/14.0, adjust=False).mean()
+
+        plus_di = 100.0 * (smooth_plus_dm / atr_series.replace(0.0, float('nan')))
+        minus_di = 100.0 * (smooth_minus_dm / atr_series.replace(0.0, float('nan')))
+        di_sum = plus_di + minus_di
+        dx = (100.0 * (plus_di - minus_di).abs() / di_sum.replace(0.0, float('nan'))).fillna(0.0)
+        adx_series = dx.ewm(alpha=1.0/14.0, adjust=False).mean()
 
         return {
             'close': float(df['close'].iloc[-1]),
-            'adx': float(adx_df['ADX_14'].iloc[-1]),
+            'adx': float(adx_series.iloc[-1]),
             'rsi': float(rsi_series.iloc[-1]),
             'atr': float(atr_series.iloc[-1]),
-            'bb_lower': float(bb_df['BBL_20_2.0'].iloc[-1]),
-            'bb_upper': float(bb_df['BBU_20_2.0'].iloc[-1])
+            'bb_lower': float(bb_lower.iloc[-1]),
+            'bb_upper': float(bb_upper.iloc[-1])
         }
     except Exception as e:
         print(f"⚠️ Market Data API Failure [{symbol}]: {e}")
@@ -514,7 +544,6 @@ def execution_orchestrator():
         with state_lock:
             is_active = positions[symbol]["position_active"]
 
-        # If safety preflight failed, only manage open positions
         if not safety_ok:
             if is_active:
                 metrics = analyze_advanced_market(symbol)

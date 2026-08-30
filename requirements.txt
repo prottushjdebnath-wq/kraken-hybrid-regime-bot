@@ -1,5 +1,4 @@
 ccxt>=4.2.0
-pandas>=2.2.0
-pandas_ta>=0.3.14b0
+pandas>=2.0.0
 requests>=2.31.0
 Flask>=3.0.0

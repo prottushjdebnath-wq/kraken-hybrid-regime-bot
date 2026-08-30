@@ -1194,7 +1194,7 @@ DASHBOARD_HTML = """
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
   <title>Institutional Multi-Exchange Terminal</title>
   <style>
     :root {
@@ -1218,6 +1218,10 @@ DASHBOARD_HTML = """
       color: var(--text);
       font-family: var(--font-mono);
       padding: 16px;
+      padding-top: calc(16px + env(safe-area-inset-top));
+      padding-left: calc(16px + env(safe-area-inset-left));
+      padding-right: calc(16px + env(safe-area-inset-right));
+      padding-bottom: calc(16px + env(safe-area-inset-bottom));
       line-height: 1.4;
       -webkit-font-smoothing: antialiased;
     }
@@ -1485,6 +1489,96 @@ DASHBOARD_HTML = """
       margin-top: 16px;
       padding: 0 4px;
     }
+
+    /* =================================================================
+       IPHONE / MOBILE LAYOUT (<= 480px, also applies up to 600px)
+       ================================================================= */
+    @media (max-width: 600px) {
+      body {
+        padding: 10px;
+        padding-top: calc(10px + env(safe-area-inset-top));
+        padding-left: calc(10px + env(safe-area-inset-left));
+        padding-right: calc(10px + env(safe-area-inset-right));
+        padding-bottom: calc(10px + env(safe-area-inset-bottom));
+      }
+
+      .header {
+        flex-direction: column;
+        align-items: flex-start;
+        padding: 12px 14px;
+      }
+      .title { font-size: 13px; gap: 6px; }
+      .badge { font-size: 10px; padding: 4px 8px; }
+      #last-updated { font-size: 11px; align-self: flex-end; }
+
+      .tabs { gap: 6px; }
+      .tab-btn {
+        flex: 1;
+        min-width: 0;
+        padding: 12px 6px;
+        font-size: 11px;
+        text-align: center;
+      }
+
+      .grid { grid-template-columns: repeat(2, 1fr); gap: 8px; }
+      .card { padding: 10px; }
+      .card-label { font-size: 9px; }
+      .card-value { font-size: 16px; }
+
+      .section-title { font-size: 12px; margin-top: 14px; }
+
+      /* Manual market columns already stack via the 700px rule above */
+      .manual-form input, .manual-form select { min-width: 0; font-size: 13px; padding: 10px; }
+      .manual-form button { padding: 10px 14px; font-size: 13px; }
+      .chip { font-size: 12px; padding: 6px 10px; }
+      .chip button { font-size: 15px; }
+
+      .param-grid { grid-template-columns: repeat(2, 1fr); }
+
+      .live-trade-card { grid-template-columns: repeat(2, 1fr); padding: 12px; gap: 8px; }
+      .ltc-field-value { font-size: 13px; }
+
+      /* Convert wide data tables into stacked cards on phones */
+      .table-container.responsive-table table thead { display: none; }
+      .table-container.responsive-table table,
+      .table-container.responsive-table table tbody,
+      .table-container.responsive-table table tr,
+      .table-container.responsive-table table td {
+        display: block;
+        width: 100%;
+      }
+      .table-container.responsive-table table { overflow-x: visible; }
+      .table-container.responsive-table tr {
+        border-bottom: 1px solid var(--border);
+        padding: 10px 12px;
+      }
+      .table-container.responsive-table tr:last-child { border-bottom: none; }
+      .table-container.responsive-table tr.empty-row {
+        text-align: center;
+        color: var(--muted);
+      }
+      .table-container.responsive-table td {
+        border-bottom: none;
+        padding: 4px 0;
+        white-space: normal;
+        display: flex;
+        justify-content: space-between;
+        gap: 10px;
+        font-size: 13px;
+      }
+      .table-container.responsive-table td[data-label]::before {
+        content: attr(data-label);
+        font-size: 10px;
+        color: var(--muted);
+        text-transform: uppercase;
+        letter-spacing: 0.4px;
+        flex-shrink: 0;
+      }
+      .table-container.responsive-table td.empty-cell::before { content: ""; }
+
+      .raw-box { font-size: 10px; max-height: 260px; overflow-y: auto; }
+      .footer { flex-direction: column; gap: 4px; }
+    }
   </style>
 </head>
 <body>
@@ -1538,7 +1632,7 @@ DASHBOARD_HTML = """
   </div>
 
   <div class="section-title">Active Positions Across Venues</div>
-  <div class="table-container">
+  <div class="table-container responsive-table">
     <table>
       <thead>
         <tr>
@@ -1562,7 +1656,7 @@ DASHBOARD_HTML = """
   </div>
 
   <div class="section-title">Cross-Exchange Top Opportunities (Ranked by Score)</div>
-  <div class="table-container">
+  <div class="table-container responsive-table">
     <table>
       <thead>
         <tr>
@@ -1816,23 +1910,23 @@ DASHBOARD_HTML = """
       actBody.innerHTML = '';
       const posEntries = Object.entries(allPositions).filter(([k, p]) => matchesFilter(p.exchange));
       if (posEntries.length === 0) {
-        actBody.innerHTML = '<tr><td colspan="11" style="color: var(--muted); text-align: center;">No open positions for this venue filter.</td></tr>';
+        actBody.innerHTML = '<tr class="empty-row"><td colspan="11" class="empty-cell" style="color: var(--muted); text-align: center;">No open positions for this venue filter.</td></tr>';
       } else {
         for (const [key, pos] of posEntries) {
           const exClass = venueClass(pos.exchange);
           const row = document.createElement('tr');
           row.innerHTML = `
-            <td><span class="venue-tag ${exClass}">${pos.exchange}</span></td>
-            <td><strong>${pos.symbol}</strong></td>
-            <td>${pos.regime}</td>
-            <td>${pos.leverage}x</td>
-            <td>${pos.units}</td>
-            <td>$${Number(pos.margin_allocated).toFixed(2)}</td>
-            <td>$${Number(pos.entry_price).toFixed(2)}</td>
-            <td>$${Number(pos.current_price).toFixed(2)}</td>
-            <td class="${pnlClass(pos.unrealized_pnl)}">${fmtMoney(pos.unrealized_pnl)}</td>
-            <td>$${Number(pos.trailing_stop).toFixed(2)}</td>
-            <td>$${Number(pos.take_profit).toFixed(2)}</td>
+            <td data-label="Venue"><span class="venue-tag ${exClass}">${pos.exchange}</span></td>
+            <td data-label="Symbol"><strong>${pos.symbol}</strong></td>
+            <td data-label="Regime">${pos.regime}</td>
+            <td data-label="Leverage">${pos.leverage}x</td>
+            <td data-label="Size">${pos.units}</td>
+            <td data-label="Margin">$${Number(pos.margin_allocated).toFixed(2)}</td>
+            <td data-label="Entry">$${Number(pos.entry_price).toFixed(2)}</td>
+            <td data-label="Live Price">$${Number(pos.current_price).toFixed(2)}</td>
+            <td data-label="Unrealized PnL" class="${pnlClass(pos.unrealized_pnl)}">${fmtMoney(pos.unrealized_pnl)}</td>
+            <td data-label="Trailing SL">$${Number(pos.trailing_stop).toFixed(2)}</td>
+            <td data-label="Target TP">$${Number(pos.take_profit).toFixed(2)}</td>
           `;
           actBody.appendChild(row);
         }
@@ -1843,21 +1937,21 @@ DASHBOARD_HTML = """
       oppBody.innerHTML = '';
       const opps = (data.top_opportunities || []).filter(item => matchesFilter(item.exchange));
       if (opps.length === 0) {
-        oppBody.innerHTML = '<tr><td colspan="8" style="color: var(--muted); text-align: center;">Evaluating candidate markets across venues...</td></tr>';
+        oppBody.innerHTML = '<tr class="empty-row"><td colspan="8" class="empty-cell" style="color: var(--muted); text-align: center;">Evaluating candidate markets across venues...</td></tr>';
       } else {
         for (const item of opps) {
           const exClass = venueClass(item.exchange);
           const row = document.createElement('tr');
           const livePrice = (item.live_price !== undefined) ? '$' + Number(item.live_price).toFixed(2) : '--';
           row.innerHTML = `
-            <td><span class="venue-tag ${exClass}">${item.exchange}</span></td>
-            <td><strong>${item.symbol}</strong></td>
-            <td>${item.regime}</td>
-            <td class="score-high">${Number(item.score).toFixed(3)}</td>
-            <td>$${Number(item.price).toFixed(2)}</td>
-            <td>${livePrice}</td>
-            <td>${Number(item.adx).toFixed(1)}</td>
-            <td>${Number(item.rsi).toFixed(1)}</td>
+            <td data-label="Venue"><span class="venue-tag ${exClass}">${item.exchange}</span></td>
+            <td data-label="Market"><strong>${item.symbol}</strong></td>
+            <td data-label="Regime">${item.regime}</td>
+            <td data-label="Score" class="score-high">${Number(item.score).toFixed(3)}</td>
+            <td data-label="Last Scanned">$${Number(item.price).toFixed(2)}</td>
+            <td data-label="Live Price">${livePrice}</td>
+            <td data-label="ADX">${Number(item.adx).toFixed(1)}</td>
+            <td data-label="RSI">${Number(item.rsi).toFixed(1)}</td>
           `;
           oppBody.appendChild(row);
         }
@@ -1890,6 +1984,535 @@ DASHBOARD_HTML = """
 </body>
 </html>
 """
+
+# =====================================================================
+# 15b. TELEGRAM MINI APP LAYOUT
+# =====================================================================
+# Register this exact URL (…/miniapp) as your bot's Web App URL in
+# BotFather. Uses the Telegram Web App JS SDK for native theme colors,
+# the platform MainButton (instead of a custom button), and haptics.
+MINIAPP_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <title>Dual-Exchange Bot</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <style>
+    :root {
+      --bg: #090d16;
+      --card: #111726;
+      --border: #1f2b45;
+      --text: #e6edf3;
+      --hint: #8b949e;
+      --link: #58a6ff;
+      --button: #58a6ff;
+      --button-text: #05080f;
+      --green: #2ea043;
+      --green-glow: rgba(46, 160, 67, 0.15);
+      --red: #f85149;
+      --red-glow: rgba(248, 81, 73, 0.15);
+      --amber: #d29922;
+      --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font);
+      padding: 12px;
+      padding-top: calc(12px + env(safe-area-inset-top));
+      padding-left: calc(12px + env(safe-area-inset-left));
+      padding-right: calc(12px + env(safe-area-inset-right));
+      padding-bottom: calc(90px + env(safe-area-inset-bottom));
+      line-height: 1.4;
+      -webkit-font-smoothing: antialiased;
+    }
+    .tg-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 12px;
+    }
+    .tg-title { font-size: 17px; font-weight: 700; display: flex; align-items: center; gap: 8px; }
+    .dot {
+      width: 8px; height: 8px; border-radius: 50%;
+      background: var(--green);
+      animation: pulse 2s infinite ease-in-out;
+      flex-shrink: 0;
+    }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+    .tg-mode-chip {
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.3px;
+      padding: 4px 9px;
+      border-radius: 999px;
+      background: var(--card);
+      border: 1px solid var(--border);
+      color: var(--hint);
+    }
+    .tg-mode-chip.paper { color: var(--amber); border-color: var(--amber); background: rgba(210,153,34,0.12); }
+    .tg-mode-chip.live { color: var(--green); border-color: var(--green); background: var(--green-glow); }
+
+    .tg-segment {
+      display: flex;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 3px;
+      margin-bottom: 12px;
+    }
+    .tg-segment button {
+      flex: 1;
+      background: none;
+      border: none;
+      color: var(--hint);
+      font-family: var(--font);
+      font-size: 13px;
+      font-weight: 600;
+      padding: 8px 4px;
+      border-radius: 8px;
+      cursor: pointer;
+    }
+    .tg-segment button.active { background: var(--button); color: var(--button-text); }
+
+    .tg-stats-row {
+      display: flex;
+      gap: 8px;
+      overflow-x: auto;
+      padding-bottom: 4px;
+      margin-bottom: 16px;
+      -webkit-overflow-scrolling: touch;
+      scrollbar-width: none;
+    }
+    .tg-stats-row::-webkit-scrollbar { display: none; }
+    .tg-stat-chip {
+      flex: 0 0 auto;
+      min-width: 118px;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 10px 12px;
+    }
+    .tg-stat-label { font-size: 10px; color: var(--hint); text-transform: uppercase; letter-spacing: 0.3px; margin-bottom: 4px; }
+    .tg-stat-value { font-size: 16px; font-weight: 700; }
+    .pnl-pos { color: var(--green); }
+    .pnl-neg { color: var(--red); }
+
+    .tg-section-title {
+      font-size: 13px;
+      font-weight: 700;
+      color: var(--hint);
+      text-transform: uppercase;
+      letter-spacing: 0.3px;
+      margin: 18px 0 8px 2px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .tg-empty {
+      background: var(--card);
+      border: 1px dashed var(--border);
+      border-radius: 12px;
+      padding: 16px;
+      text-align: center;
+      color: var(--hint);
+      font-size: 13px;
+    }
+
+    .tg-pos-card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 12px 14px;
+      margin-bottom: 8px;
+    }
+    .tg-pos-top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+    .tg-pos-symbol { font-size: 15px; font-weight: 700; display: flex; align-items: center; gap: 6px; }
+    .venue-pill {
+      font-size: 10px; font-weight: 700; text-transform: uppercase;
+      padding: 2px 7px; border-radius: 6px;
+    }
+    .venue-binance { background: rgba(240, 185, 11, 0.15); color: #f0b90b; }
+    .venue-kraken { background: rgba(87, 65, 217, 0.18); color: #9c88ff; }
+    .tg-pos-pnl { font-size: 15px; font-weight: 700; }
+    .tg-pos-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 6px 10px;
+      font-size: 12px;
+    }
+    .tg-pos-grid div span { display: block; color: var(--hint); font-size: 10px; text-transform: uppercase; margin-bottom: 1px; }
+
+    .tg-opp-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px 12px;
+      margin-bottom: 6px;
+      font-size: 13px;
+    }
+    .tg-opp-left { display: flex; align-items: center; gap: 8px; }
+    .tg-opp-score { font-weight: 700; color: var(--green); }
+
+    .tg-watchlist-toggle { display: flex; gap: 8px; margin-bottom: 8px; }
+    .tg-watchlist-toggle button {
+      flex: 1;
+      background: var(--card);
+      border: 1px solid var(--border);
+      color: var(--hint);
+      font-family: var(--font);
+      font-weight: 600;
+      font-size: 13px;
+      padding: 8px;
+      border-radius: 8px;
+    }
+    .tg-watchlist-toggle button.active { color: var(--text); border-color: var(--link); }
+    .tg-add-form { display: flex; gap: 6px; margin-bottom: 10px; }
+    .tg-add-form input {
+      flex: 1;
+      background: var(--card);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 10px 12px;
+      border-radius: 8px;
+      font-family: var(--font);
+      font-size: 13px;
+    }
+    .tg-add-form button {
+      background: var(--button);
+      color: var(--button-text);
+      border: none;
+      padding: 0 16px;
+      border-radius: 8px;
+      font-family: var(--font);
+      font-weight: 700;
+      font-size: 13px;
+    }
+    .tg-chip-row { display: flex; flex-wrap: wrap; gap: 6px; }
+    .tg-chip {
+      display: inline-flex; align-items: center; gap: 6px;
+      background: var(--card); border: 1px solid var(--border);
+      padding: 5px 9px; border-radius: 999px; font-size: 12px;
+    }
+    .tg-chip button { background: none; border: none; color: var(--red); font-weight: 700; font-size: 14px; padding: 0; }
+    .tg-status-note { font-size: 11px; color: var(--hint); margin-top: 6px; min-height: 14px; }
+
+    details.tg-params {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 10px 14px;
+    }
+    details.tg-params summary {
+      font-size: 13px; font-weight: 700; cursor: pointer; list-style: none;
+      display: flex; justify-content: space-between; align-items: center;
+    }
+    details.tg-params summary::-webkit-details-marker { display: none; }
+    .tg-param-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 12px; margin-top: 10px; }
+    .tg-param-grid div span { display: block; font-size: 10px; color: var(--hint); text-transform: uppercase; }
+    .tg-param-grid div b { font-size: 13px; }
+
+    .tg-footer-note { text-align: center; font-size: 11px; color: var(--hint); margin-top: 20px; }
+  </style>
+</head>
+<body>
+  <div class="tg-header">
+    <div class="tg-title"><span class="dot"></span>Dual-Exchange Bot</div>
+    <span class="tg-mode-chip" id="tg-mode-chip">SYNCING</span>
+  </div>
+
+  <div class="tg-segment">
+    <button class="active" data-venue="all" onclick="setVenue('all')">All</button>
+    <button data-venue="binance" onclick="setVenue('binance')">Binance</button>
+    <button data-venue="kraken" onclick="setVenue('kraken')">Kraken</button>
+  </div>
+
+  <div class="tg-stats-row" id="tg-stats-row">
+    <div class="tg-stat-chip"><div class="tg-stat-label">Loading</div><div class="tg-stat-value">--</div></div>
+  </div>
+
+  <div class="tg-section-title">🔴 Live Trades</div>
+  <div id="tg-positions">
+    <div class="tg-empty">No open positions right now.</div>
+  </div>
+
+  <div class="tg-section-title">🎯 Top Signals</div>
+  <div id="tg-opportunities">
+    <div class="tg-empty">Scanning markets...</div>
+  </div>
+
+  <div class="tg-section-title">➕ Manual Watchlist</div>
+  <div class="tg-watchlist-toggle">
+    <button class="active" data-ex="binance" onclick="setWatchExchange('binance')">Binance</button>
+    <button data-ex="kraken" onclick="setWatchExchange('kraken')">Kraken</button>
+  </div>
+  <div class="tg-add-form">
+    <input type="text" id="tg-symbol-input" placeholder="e.g. BTC/USDT" />
+    <button onclick="tgAddSymbol()">Add</button>
+  </div>
+  <div class="tg-chip-row" id="tg-watchlist-chips"></div>
+  <div class="tg-status-note" id="tg-watch-status"></div>
+
+  <div class="tg-section-title">⚙️ Bot Parameters</div>
+  <details class="tg-params">
+    <summary>View entry parameters <span id="tg-params-caret">▾</span></summary>
+    <div class="tg-param-grid" id="tg-param-grid"></div>
+  </details>
+
+  <div class="tg-footer-note">Full terminal available at /</div>
+
+  <script>
+    const tg = (window.Telegram && window.Telegram.WebApp) ? window.Telegram.WebApp : null;
+    let venueFilter = 'all';
+    let watchExchange = 'binance';
+    let lastSnapshot = null;
+
+    function applyTelegramTheme() {
+      if (!tg) return;
+      const p = tg.themeParams || {};
+      const root = document.documentElement.style;
+      if (p.bg_color) root.setProperty('--bg', p.bg_color);
+      if (p.text_color) root.setProperty('--text', p.text_color);
+      if (p.hint_color) root.setProperty('--hint', p.hint_color);
+      if (p.link_color) root.setProperty('--link', p.link_color);
+      if (p.button_color) root.setProperty('--button', p.button_color);
+      if (p.button_text_color) root.setProperty('--button-text', p.button_text_color);
+      if (p.secondary_bg_color) root.setProperty('--card', p.secondary_bg_color);
+      try {
+        tg.setHeaderColor(p.bg_color || '#090d16');
+        tg.setBackgroundColor(p.bg_color || '#090d16');
+      } catch (e) { /* older client versions may not support this */ }
+    }
+
+    if (tg) {
+      tg.ready();
+      tg.expand();
+      applyTelegramTheme();
+      tg.onEvent('themeChanged', applyTelegramTheme);
+      tg.MainButton.setText('REFRESH');
+      tg.MainButton.show();
+      tg.MainButton.onClick(() => {
+        if (tg.HapticFeedback) tg.HapticFeedback.impactOccurred('light');
+        updateDashboard();
+      });
+    }
+
+    function setVenue(v) {
+      venueFilter = v;
+      document.querySelectorAll('.tg-segment button').forEach(b => b.classList.toggle('active', b.dataset.venue === v));
+      if (tg && tg.HapticFeedback) tg.HapticFeedback.selectionChanged();
+      if (lastSnapshot) render(lastSnapshot);
+    }
+
+    function setWatchExchange(ex) {
+      watchExchange = ex;
+      document.querySelectorAll('.tg-watchlist-toggle button').forEach(b => b.classList.toggle('active', b.dataset.ex === ex));
+      if (tg && tg.HapticFeedback) tg.HapticFeedback.selectionChanged();
+      if (lastSnapshot) renderWatchlist(lastSnapshot.manual_watchlist || {});
+    }
+
+    function fmtMoney(n) {
+      const v = Number(n || 0);
+      return (v >= 0 ? '$' : '-$') + Math.abs(v).toFixed(2);
+    }
+    function pnlClass(n) { return Number(n) >= 0 ? 'pnl-pos' : 'pnl-neg'; }
+    function matchesFilter(ex) { return venueFilter === 'all' || ex === venueFilter; }
+    function venueClass(ex) { return ex === 'binance' ? 'venue-binance' : 'venue-kraken'; }
+
+    async function tgAddSymbol() {
+      const input = document.getElementById('tg-symbol-input');
+      const status = document.getElementById('tg-watch-status');
+      const symbol = (input.value || '').trim().toUpperCase();
+      if (!symbol.includes('/')) {
+        status.textContent = 'Enter symbol as BASE/QUOTE, e.g. BTC/USDT';
+        return;
+      }
+      status.textContent = 'Adding ' + symbol + '...';
+      try {
+        const res = await fetch('/manual-market', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ exchange: watchExchange, symbol: symbol, action: 'add' })
+        });
+        const data = await res.json();
+        if (!res.ok) { status.textContent = data.error || 'Failed to add.'; return; }
+        input.value = '';
+        status.textContent = symbol + ' added.';
+        if (tg && tg.HapticFeedback) tg.HapticFeedback.notificationOccurred('success');
+        renderWatchlist(data);
+      } catch (err) {
+        status.textContent = 'Request failed.';
+      }
+    }
+
+    async function tgRemoveSymbol(exchange, symbol) {
+      try {
+        const res = await fetch('/manual-market', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ exchange: exchange, symbol: symbol, action: 'remove' })
+        });
+        const data = await res.json();
+        if (res.ok) renderWatchlist(data);
+      } catch (err) { /* ignore */ }
+    }
+
+    function renderWatchlist(watchlist) {
+      const container = document.getElementById('tg-watchlist-chips');
+      const symbols = watchlist[watchExchange] || [];
+      container.innerHTML = '';
+      if (!symbols.length) {
+        container.innerHTML = '<span style="color: var(--hint); font-size: 12px;">No manual symbols yet.</span>';
+        return;
+      }
+      for (const sym of symbols) {
+        const chip = document.createElement('span');
+        chip.className = 'tg-chip';
+        chip.innerHTML = '<span>' + sym + '</span>';
+        const btn = document.createElement('button');
+        btn.textContent = '×';
+        btn.onclick = () => tgRemoveSymbol(watchExchange, sym);
+        chip.appendChild(btn);
+        container.appendChild(chip);
+      }
+    }
+
+    function renderParams(params) {
+      const grid = document.getElementById('tg-param-grid');
+      if (!params) return;
+      const entries = [
+        ['Risk / Trade', (params.risk_pct_per_trade * 100).toFixed(2) + '%'],
+        ['Reward:Risk', '1:' + params.rr_ratio],
+        ['Leverage', params.min_leverage + 'x–' + params.max_leverage + 'x'],
+        ['Max Positions', params.max_concurrent_positions],
+        ['Max Margin Use', (params.max_portfolio_margin_pct * 100).toFixed(0) + '%'],
+        ['ADX Threshold', params.adx_trend_threshold],
+        ['ATR Multiplier', params.atr_multiplier],
+        ['Timeframe', params.timeframe],
+        ['Loop Interval', params.loop_interval_seconds + 's'],
+        ['Live Refresh', params.live_price_refresh_seconds + 's']
+      ];
+      grid.innerHTML = '';
+      for (const [label, value] of entries) {
+        const item = document.createElement('div');
+        item.innerHTML = '<span>' + label + '</span><b>' + value + '</b>';
+        grid.appendChild(item);
+      }
+    }
+
+    function render(data) {
+      const modeChip = document.getElementById('tg-mode-chip');
+      if (data.mode === 'PAPER_TRADING') {
+        modeChip.textContent = 'PAPER';
+        modeChip.className = 'tg-mode-chip paper';
+      } else {
+        modeChip.textContent = data.binance_testnet ? 'TESTNET' : 'LIVE';
+        modeChip.className = 'tg-mode-chip ' + (data.binance_testnet ? '' : 'live');
+      }
+
+      const positions = data.positions || {};
+      const posEntries = Object.entries(positions).filter(([k, p]) => matchesFilter(p.exchange));
+
+      const realizedForFilter = venueFilter === 'all'
+        ? data.realized_pnl_total
+        : (data.realized_pnl_by_exchange ? data.realized_pnl_by_exchange[venueFilter] : 0) || 0;
+
+      const statsRow = document.getElementById('tg-stats-row');
+      statsRow.innerHTML = '';
+      const stats = [];
+      if (data.mode === 'PAPER_TRADING') {
+        stats.push(['Virtual Balance', '$' + Number(data.virtual_balance_usdt || 0).toFixed(2), '']);
+      }
+      stats.push(['Open Positions', posEntries.length + ' / ' + (data.bot_parameters ? data.bot_parameters.max_concurrent_positions : 3), '']);
+      stats.push(['Unrealized PnL', fmtMoney(data.total_unrealized_pnl), pnlClass(data.total_unrealized_pnl)]);
+      stats.push(['Realized PnL', fmtMoney(realizedForFilter), pnlClass(realizedForFilter)]);
+      stats.push(['Margin Used', '$' + Number(data.total_margin_allocated || 0).toFixed(2), '']);
+      for (const [label, value, cls] of stats) {
+        const chip = document.createElement('div');
+        chip.className = 'tg-stat-chip';
+        chip.innerHTML = '<div class="tg-stat-label">' + label + '</div><div class="tg-stat-value ' + cls + '">' + value + '</div>';
+        statsRow.appendChild(chip);
+      }
+
+      const posContainer = document.getElementById('tg-positions');
+      posContainer.innerHTML = '';
+      if (posEntries.length === 0) {
+        posContainer.innerHTML = '<div class="tg-empty">No open positions right now.</div>';
+      } else {
+        for (const [key, pos] of posEntries) {
+          const card = document.createElement('div');
+          card.className = 'tg-pos-card';
+          card.innerHTML = `
+            <div class="tg-pos-top">
+              <div class="tg-pos-symbol"><span class="venue-pill ${venueClass(pos.exchange)}">${pos.exchange}</span> ${pos.symbol}</div>
+              <div class="tg-pos-pnl ${pnlClass(pos.unrealized_pnl)}">${fmtMoney(pos.unrealized_pnl)}</div>
+            </div>
+            <div class="tg-pos-grid">
+              <div><span>Entry</span>$${Number(pos.entry_price).toFixed(2)}</div>
+              <div><span>Live</span>$${Number(pos.current_price).toFixed(2)}</div>
+              <div><span>Lev</span>${pos.leverage}x</div>
+              <div><span>SL</span>$${Number(pos.trailing_stop).toFixed(2)}</div>
+              <div><span>TP</span>$${Number(pos.take_profit).toFixed(2)}</div>
+              <div><span>Regime</span>${pos.regime}</div>
+            </div>
+          `;
+          posContainer.appendChild(card);
+        }
+      }
+
+      const oppContainer = document.getElementById('tg-opportunities');
+      oppContainer.innerHTML = '';
+      const opps = (data.top_opportunities || []).filter(item => matchesFilter(item.exchange));
+      if (opps.length === 0) {
+        oppContainer.innerHTML = '<div class="tg-empty">Scanning markets...</div>';
+      } else {
+        for (const item of opps.slice(0, 8)) {
+          const row = document.createElement('div');
+          row.className = 'tg-opp-row';
+          row.innerHTML = `
+            <div class="tg-opp-left">
+              <span class="venue-pill ${venueClass(item.exchange)}">${item.exchange}</span>
+              <span>${item.symbol}</span>
+            </div>
+            <div class="tg-opp-score">${Number(item.score).toFixed(3)}</div>
+          `;
+          oppContainer.appendChild(row);
+        }
+      }
+
+      renderParams(data.bot_parameters);
+      renderWatchlist(data.manual_watchlist || {});
+    }
+
+    async function updateDashboard() {
+      try {
+        const res = await fetch('/status');
+        const data = await res.json();
+        lastSnapshot = data;
+        render(data);
+      } catch (err) {
+        console.error('Status fetch failed', err);
+      }
+    }
+
+    updateDashboard();
+    setInterval(updateDashboard, 4000);
+  </script>
+</body>
+</html>
+"""
+
+@app.route("/miniapp", methods=["GET"])
+def miniapp():
+    return render_template_string(MINIAPP_HTML)
 
 @app.route("/", methods=["GET"])
 def dashboard():
@@ -2018,6 +2641,7 @@ if __name__ == "__main__":
     print(f"🌐 Starting Dual-Exchange Web Service on 0.0.0.0:{SERVER_PORT}")
     print(f"🏛️ Enabled Venues: {list(exchanges.keys())}")
     print("💻 Dashboard: /")
+    print("📱 Telegram Mini App: /miniapp")
     print("📡 Health Check: /health")
     print("📊 Telemetry API: /status")
     print("⚙️  Config API: /config")

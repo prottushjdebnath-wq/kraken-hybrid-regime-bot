@@ -27,18 +27,21 @@ ENABLE_TELEGRAM = os.environ.get("ENABLE_TELEGRAM", "false").strip().lower() in 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
-SYMBOLS_RAW = os.environ.get("TRADING_SYMBOLS", "BTC/USDT,ETH/USDT").strip()
+# Candidate Pool Watchlist
+SYMBOLS_RAW = os.environ.get("TRADING_SYMBOLS", "SOL/USDT,BTC/USDT,ETH/USDT").strip()
 SYMBOLS = [s.strip() for s in SYMBOLS_RAW.split(",") if s.strip()]
-
-TRADE_AMOUNTS_RAW = os.environ.get("TRADE_AMOUNTS", '{"BTC/USDT": 0.0005, "ETH/USDT": 0.01}').strip()
-try:
-    TRADE_AMOUNTS = json.loads(TRADE_AMOUNTS_RAW)
-except Exception:
-    TRADE_AMOUNTS = {"BTC/USDT": 0.0005, "ETH/USDT": 0.01}
 
 TIMEFRAME = os.environ.get("TRADING_TIMEFRAME", "15m").strip()
 ADX_TREND_THRESHOLD = float(os.environ.get("ADX_TREND_THRESHOLD", "25.0"))
 ATR_MULTIPLIER = float(os.environ.get("ATR_MULTIPLIER", "1.5"))
+
+# DYNAMIC RISK & PORTFOLIO SIZING PARAMETERS
+RISK_PCT_PER_TRADE = float(os.environ.get("RISK_PCT_PER_TRADE", "0.015"))  # 1.5% equity risked per trade
+RR_RATIO = float(os.environ.get("RR_RATIO", "2.0"))                       # 1:2 Risk to Reward Take-Profit
+MIN_LEVERAGE = float(os.environ.get("MIN_LEVERAGE", "1.0"))
+MAX_LEVERAGE = float(os.environ.get("MAX_LEVERAGE", "3.0"))               # Software-side hard cap (<= 5x max)
+MAX_CONCURRENT_POSITIONS = int(os.environ.get("MAX_CONCURRENT_POSITIONS", "2"))
+MAX_PORTFOLIO_MARGIN_PCT = float(os.environ.get("MAX_PORTFOLIO_MARGIN_PCT", "0.60")) # Max 60% of equity in margin
 
 MAX_FAILURES_ALLOWED = int(os.environ.get("MAX_FAILURES_ALLOWED", "3"))
 MIN_BALANCE_USDT = float(os.environ.get("MIN_BALANCE_USDT", "10.0"))
@@ -77,7 +80,7 @@ def validate_environment():
 validate_environment()
 
 # =====================================================================
-# 2. SYNCHRONIZED RUNTIME STATE
+# 2. SYNCHRONIZED RUNTIME STATE (MULTI-PAIR & MARGIN SCHEMA)
 # =====================================================================
 state_lock = threading.Lock()
 
@@ -87,7 +90,13 @@ for s in SYMBOLS:
         "position_active": False,
         "entry_price": 0.0,
         "trailing_stop": 0.0,
-        "stop_loss_distance": 0.0
+        "stop_loss_distance": 0.0,
+        "take_profit": 0.0,
+        "leverage": 1.0,
+        "units": 0.0,
+        "margin_allocated": 0.0,
+        "regime": "NONE",
+        "confidence": 0.0
     }
 
 virtual_balance_usdt = PAPER_INITIAL_BALANCE
@@ -103,30 +112,32 @@ engine_status = {
     "startup_reconciled": False,
     "startup_timestamp": None,
     "paper_trading": PAPER_TRADING,
-    "persistence_backend": "UPSTASH_REDIS_REST"
+    "persistence_backend": "UPSTASH_REDIS_REST",
+    "active_news_status": "MONITORING"
 }
 
 def utc_now_iso():
-    """Return a timezone-aware UTC timestamp formatted in ISO 8601."""
     return datetime.now(timezone.utc).isoformat()
 
 def update_engine_status(**kwargs):
-    """Thread-safe status updates for HTTP monitoring endpoints."""
     with state_lock:
         engine_status.update(kwargs)
 
 def get_status_snapshot():
-    """Return an in-memory thread-safe diagnostic snapshot."""
     with state_lock:
+        total_margin_used = sum(p["margin_allocated"] for p in positions.values() if p["position_active"])
         snapshot = dict(engine_status)
         snapshot.update({
             "mode": "PAPER_TRADING" if PAPER_TRADING else "LIVE_CAPITAL",
             "virtual_balance_usdt": virtual_balance_usdt if PAPER_TRADING else None,
+            "total_margin_allocated": round(total_margin_used, 2),
             "tracked_symbols": SYMBOLS,
             "timeframe": TIMEFRAME,
-            "trade_amounts": TRADE_AMOUNTS,
             "positions": {sym: dict(data) for sym, data in positions.items()},
             "consecutive_failures": consecutive_failures,
+            "risk_pct_per_trade": RISK_PCT_PER_TRADE,
+            "rr_ratio": RR_RATIO,
+            "max_leverage": MAX_LEVERAGE
         })
     return snapshot
 
@@ -144,7 +155,6 @@ exchange = ccxt.kraken(exchange_params)
 # 4. EXTERNAL STATE PERSISTENCE (UPSTASH REST ENGINE)
 # =====================================================================
 def upstash_command(command_list):
-    """Execute a raw Redis command array via Upstash HTTPS REST API."""
     url = UPSTASH_REDIS_REST_URL.rstrip('/')
     headers = {
         "Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}",
@@ -158,7 +168,6 @@ def upstash_command(command_list):
     return payload.get("result")
 
 def save_state():
-    """Persist all positions and virtual balances to Upstash Redis REST and local sidecar."""
     with state_lock:
         state = {
             'paper_trading': PAPER_TRADING,
@@ -186,7 +195,6 @@ def save_state():
         print(f"⚠️ Secondary local state save warning: {e}")
 
 def load_state():
-    """Recover multi-symbol state on startup from Upstash Redis REST or local disk."""
     global positions, virtual_balance_usdt, consecutive_failures
 
     recovered_raw = None
@@ -210,7 +218,7 @@ def load_state():
             except Exception as e:
                 print(f"⚠️ Failed reading local sidecar: {e}")
         else:
-            print("ℹ️ No prior state found in Upstash or local disk. Initializing fresh registry.")
+            print("ℹ️ No prior state found in Upstash or local disk. Initializing clean registry.")
             return
 
     try:
@@ -228,30 +236,51 @@ def load_state():
                     entry_p = float(p.get('entry_price', 0.0))
                     t_stop = float(p.get('trailing_stop', 0.0))
                     buf = float(p.get('stop_loss_distance', 0.0))
+                    tp = float(p.get('take_profit', 0.0))
+                    lev = float(p.get('leverage', 1.0))
+                    unt = float(p.get('units', 0.0))
+                    marg = float(p.get('margin_allocated', 0.0))
+                    reg = p.get('regime', 'NONE')
+                    conf = float(p.get('confidence', 0.0))
 
                     if buf <= 0.0 and is_active and entry_p > t_stop:
                         buf = entry_p - t_stop
+                    if tp <= 0.0 and is_active and entry_p > 0:
+                        tp = entry_p + (buf * RR_RATIO)
 
                     positions[sym] = {
                         "position_active": is_active,
                         "entry_price": entry_p,
                         "trailing_stop": t_stop,
-                        "stop_loss_distance": buf
+                        "stop_loss_distance": buf,
+                        "take_profit": tp,
+                        "leverage": lev,
+                        "units": unt,
+                        "margin_allocated": marg,
+                        "regime": reg,
+                        "confidence": conf
                     }
                 else:
                     positions[sym] = {
                         "position_active": False,
                         "entry_price": 0.0,
                         "trailing_stop": 0.0,
-                        "stop_loss_distance": 0.0
+                        "stop_loss_distance": 0.0,
+                        "take_profit": 0.0,
+                        "leverage": 1.0,
+                        "units": 0.0,
+                        "margin_allocated": 0.0,
+                        "regime": "NONE",
+                        "confidence": 0.0
                     }
 
         print(f"♻️ Recovered State (last_updated={state.get('last_updated')})")
         if PAPER_TRADING:
-            print(f"   ↳ [MODE: PAPER] Virtual Balance: ${virtual_balance_usdt:.2f} USDT")
+            print(f"   ↳ [PAPER] Virtual Balance: ${virtual_balance_usdt:.2f} USDT")
         for sym in SYMBOLS:
             p = positions[sym]
-            print(f"   ↳ [{sym}] Active: {p['position_active']} | Entry: {p['entry_price']:.2f} | Stop: {p['trailing_stop']:.2f}")
+            if p["position_active"]:
+                print(f"   ↳ [{sym}] ACTIVE | Entry: {p['entry_price']:.2f} | Stop: {p['trailing_stop']:.2f} | TP: {p['take_profit']:.2f} | Lev: {p['leverage']}x")
 
     except Exception as e:
         msg = f"💥 Corrupt state format encountered during recovery: {e}"
@@ -263,16 +292,15 @@ def load_state():
 # 5. STARTUP RECONCILIATION
 # =====================================================================
 def reconcile_state_with_exchange():
-    """Cross-check state against live Kraken balances if live, or validate virtual holdings if paper."""
     global positions
 
     if PAPER_TRADING:
-        print("📄 Paper Trading Mode active: Live balance reconciliation bypassed.")
+        print("📄 Paper Trading Mode active: Real exchange balance reconciliation bypassed.")
         with state_lock:
             for sym in SYMBOLS:
                 p = positions[sym]
                 if p["position_active"]:
-                    print(f"   ↳ Retaining virtual position for [{sym}] at entry ${p['entry_price']:.2f}")
+                    print(f"   ↳ Active Virtual Position: [{sym}] | Entry: ${p['entry_price']:.2f} | Leverage: {p['leverage']}x")
         return True
 
     try:
@@ -281,16 +309,16 @@ def reconcile_state_with_exchange():
 
         for sym in SYMBOLS:
             base_asset = sym.split('/')[0]
-            trade_amt = TRADE_AMOUNTS.get(sym, 0.0005)
+            with state_lock:
+                expected_units = positions[sym]["units"]
+                current_pos = positions[sym]["position_active"]
 
             base_balance = (
                 balances['free'].get(base_asset, 0.0)
                 + balances.get('used', {}).get(base_asset, 0.0)
             )
-            holds_asset = base_balance >= (trade_amt * 0.9)
-
-            with state_lock:
-                current_pos = positions[sym]["position_active"]
+            threshold = expected_units * 0.9 if expected_units > 0 else 0.0001
+            holds_asset = base_balance >= threshold
 
             print(f"🔎 Startup reconciliation [{sym}] | {base_asset} balance={base_balance:.8f} | local_active={current_pos}")
 
@@ -306,14 +334,20 @@ def reconcile_state_with_exchange():
                         "position_active": False,
                         "entry_price": 0.0,
                         "trailing_stop": 0.0,
-                        "stop_loss_distance": 0.0
+                        "stop_loss_distance": 0.0,
+                        "take_profit": 0.0,
+                        "leverage": 1.0,
+                        "units": 0.0,
+                        "margin_allocated": 0.0,
+                        "regime": "NONE",
+                        "confidence": 0.0
                     }
                 dirty = True
 
             elif not current_pos and holds_asset:
                 msg = (
                     f"⚠️ *STATE MISMATCH* [{sym}]: Exchange shows {base_asset} balance ({base_balance:.8f}) "
-                    f"but local state says NO position is open. Halting to prevent untracked risk."
+                    f"but local state says NO position is open. Halting to defend unmanaged capital."
                 )
                 print(msg)
                 send_telegram_notification(msg)
@@ -322,7 +356,7 @@ def reconcile_state_with_exchange():
         if dirty:
             save_state()
 
-        print("✅ Startup live balance reconciliation completed successfully.")
+        print("✅ Startup reconciliation completed.")
         return True
 
     except SystemExit:
@@ -337,7 +371,6 @@ def reconcile_state_with_exchange():
 # 6. TELEGRAM & AUDIT LOGGING UTILITIES
 # =====================================================================
 def send_telegram_notification(message):
-    """Sends real-time push alerts via Telegram."""
     if not ENABLE_TELEGRAM:
         return
     try:
@@ -353,8 +386,7 @@ def send_telegram_notification(message):
     except Exception as e:
         print(f"⚠️ Telegram Alert Failed: {e}")
 
-def log_trade_to_ledger(timestamp, symbol, order_id, side, regime, price, amount, stop_loss, status):
-    """Appends trade records to durable Upstash List and local CSV."""
+def log_trade_to_ledger(timestamp, symbol, order_id, side, regime, price, amount, stop_loss, take_profit, leverage, status):
     trade_record = {
         'Timestamp': timestamp,
         'Mode': 'PAPER' if PAPER_TRADING else 'LIVE',
@@ -365,6 +397,8 @@ def log_trade_to_ledger(timestamp, symbol, order_id, side, regime, price, amount
         'ExecutionPrice': float(price),
         'Amount': float(amount),
         'StopLoss': float(stop_loss),
+        'TakeProfit': float(take_profit),
+        'Leverage': float(leverage),
         'Status': status
     }
 
@@ -387,10 +421,57 @@ def log_trade_to_ledger(timestamp, symbol, order_id, side, regime, price, amount
         print(f"⚠️ Failed to write local trade CSV: {e}")
 
 # =====================================================================
-# 7. HARDENED SAFETY LAYER & PRE-FLIGHT BALANCES
+# 7. NEWS & SENTIMENT SAFETY SHIELD (FAIL-OPEN)
+# =====================================================================
+NEGATIVE_NEWS_KEYWORDS = [
+    'hack', 'exploit', 'sec', 'lawsuit', 'ban', 'insolvent', 'scam',
+    'fraud', 'investigation', 'crash', 'collapse', 'halt', 'attack', 'subpoena'
+]
+
+def check_news_safety(symbol):
+    """
+    Scans public crypto news feeds for high-severity negative catalysts.
+    Fails open (returns True) on network or API timeouts to prevent trade deadlocks.
+    """
+    base_asset = symbol.split('/')[0].upper()
+    try:
+        url = "https://min-api.cryptocompare.com/data/v2/news/?lang=EN"
+        res = requests.get(url, timeout=5)
+        if res.status_code != 200:
+            return True, "NEWS_API_UNAVAILABLE (PASSED)"
+
+        data = res.json().get("Data", [])
+        negative_hits = 0
+        matching_articles = 0
+
+        for article in data[:15]:
+            title = article.get("title", "").lower()
+            body = article.get("body", "").lower()
+            text_corpus = f"{title} {body}"
+
+            # Check if article concerns this asset
+            if base_asset.lower() in text_corpus or symbol.lower() in text_corpus:
+                matching_articles += 1
+                for kw in NEGATIVE_NEWS_KEYWORDS:
+                    if kw in text_corpus:
+                        negative_hits += 1
+                        break
+
+        if matching_articles > 0 and negative_hits >= 2:
+            warning = f"BLOCKED: {negative_hits} negative news triggers detected for {base_asset}."
+            print(f"🛡️ [NEWS SHIELD] {warning}")
+            return False, warning
+
+        return True, "NEWS_CLEAR"
+
+    except Exception as e:
+        # Fail open
+        return True, f"NEWS_CHECK_BYPASS ({e})"
+
+# =====================================================================
+# 8. HARDENED SAFETY LAYER & PRE-FLIGHT BALANCES
 # =====================================================================
 def check_safety_preflight():
-    """Verifies cash reserves exist and API authentication remains intact."""
     global consecutive_failures, virtual_balance_usdt
 
     if PAPER_TRADING:
@@ -436,10 +517,9 @@ def check_safety_preflight():
         return False
 
 # =====================================================================
-# 8. TECHNICAL INDICATOR ENGINE (VECTORIZED PANDAS)
+# 9. TECHNICAL INDICATOR ENGINE (PURE PANDAS)
 # =====================================================================
 def analyze_advanced_market(symbol):
-    """Calculates ADX, Bollinger Bands, RSI, and ATR natively using Pandas."""
     try:
         bars = exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=100)
         df = pd.DataFrame(
@@ -500,54 +580,144 @@ def analyze_advanced_market(symbol):
         return None
 
 # =====================================================================
-# 9. LIVE POSITION GUARD ENGINE (PER-PAIR)
+# 10. ADAPTIVE LEVERAGE & DYNAMIC POSITION SIZING CALCULATOR
+# =====================================================================
+def calculate_dynamic_entry(symbol, current_price, atr, regime, metrics):
+    """
+    Computes:
+    1. Signal Confidence Score (0.0 to 1.0)
+    2. Adaptive Bounded Leverage (MIN_LEVERAGE to MAX_LEVERAGE)
+    3. Risk-Based Position Sizing: (Equity * Risk%) / Stop_Distance
+    4. Take-Profit Target (1:2 R:R)
+    """
+    with state_lock:
+        if PAPER_TRADING:
+            equity = virtual_balance_usdt
+        else:
+            try:
+                bal = exchange.fetch_balance()
+                equity = float(bal['free'].get('USDT', 0.0) + bal.get('used', {}).get('USDT', 0.0))
+            except Exception:
+                equity = 100.0
+
+    # 1. Signal Confidence Calculation
+    if regime == "SIDEWAYS":
+        # Deeper penetration below Bollinger Lower Band = higher confidence
+        bb_depth = max(0.0, metrics['bb_lower'] - current_price)
+        depth_ratio = min(1.0, bb_depth / (atr * 0.75 + 1e-6))
+        adx_flatness = max(0.0, (ADX_TREND_THRESHOLD - metrics['adx']) / ADX_TREND_THRESHOLD)
+        confidence = round(0.4 * depth_ratio + 0.6 * adx_flatness, 2)
+    else:  # SWING
+        # Lower RSI and stronger ADX trend = higher breakout momentum confidence
+        rsi_extreme = max(0.0, (30.0 - metrics['rsi']) / 20.0)
+        adx_strength = min(1.0, (metrics['adx'] - ADX_TREND_THRESHOLD) / 30.0)
+        confidence = round(0.5 * rsi_extreme + 0.5 * adx_strength, 2)
+
+    confidence = max(0.1, min(1.0, confidence))
+
+    # 2. Adaptive Leverage (Bounded strictly between MIN_LEVERAGE and MAX_LEVERAGE <= 5.0)
+    effective_max_leverage = min(5.0, MAX_LEVERAGE)
+    leverage = round(MIN_LEVERAGE + confidence * (effective_max_leverage - MIN_LEVERAGE), 1)
+
+    # 3. Dynamic Position Sizing (Risk-based dollar floor)
+    dollar_risk = equity * RISK_PCT_PER_TRADE
+    stop_distance = atr * ATR_MULTIPLIER
+    calculated_stop = current_price - stop_distance
+    take_profit = current_price + (stop_distance * RR_RATIO)
+
+    # Unit sizing so that stop hit exactly equals dollar_risk
+    units = dollar_risk / stop_distance
+    notional_value = units * current_price
+    margin_required = notional_value / leverage
+
+    # Portfolio Guard: Enforce maximum margin exposure limits
+    with state_lock:
+        current_margin_used = sum(p["margin_allocated"] for p in positions.values() if p["position_active"])
+
+    available_margin_budget = (equity * MAX_PORTFOLIO_MARGIN_PCT) - current_margin_used
+
+    if margin_required > available_margin_budget:
+        # Scale back units if budget exceeded
+        if available_margin_budget > 10.0:
+            margin_required = available_margin_budget
+            notional_value = margin_required * leverage
+            units = notional_value / current_price
+        else:
+            return None  # Insufficient margin allowance
+
+    return {
+        "confidence": confidence,
+        "leverage": leverage,
+        "units": round(units, 6),
+        "margin_required": round(margin_required, 2),
+        "trailing_stop": round(calculated_stop, 2),
+        "take_profit": round(take_profit, 2),
+        "stop_distance": round(stop_distance, 2)
+    }
+
+# =====================================================================
+# 11. LIVE POSITION GUARD ENGINE (TRAILING SL & TP)
 # =====================================================================
 def manage_active_position(symbol, current_price):
     global positions, virtual_balance_usdt
 
     with state_lock:
-        curr_entry = positions[symbol]["entry_price"]
-        curr_stop = positions[symbol]["trailing_stop"]
-        risk_dist = positions[symbol]["stop_loss_distance"]
+        pos = positions[symbol]
+        curr_entry = pos["entry_price"]
+        curr_stop = pos["trailing_stop"]
+        curr_tp = pos["take_profit"]
+        risk_dist = pos["stop_loss_distance"]
+        units = pos["units"]
+        leverage = pos["leverage"]
+        margin_allocated = pos["margin_allocated"]
+        regime = pos["regime"]
 
     mode_label = "PAPER" if PAPER_TRADING else "LIVE"
     print(
-        f"🛡️ [{mode_label} | {symbol}] Active Position | Entry: {curr_entry:.2f} | "
-        f"Current: {current_price:.2f} | Trailing Stop: {curr_stop:.2f}"
+        f"🛡️ [{mode_label} | {symbol}] {regime} | Entry: {curr_entry:.2f} | Current: {current_price:.2f} | "
+        f"SL: {curr_stop:.2f} | TP: {curr_tp:.2f} | Lev: {leverage}x"
     )
 
+    exit_triggered = False
+    exit_type = ""
+
     if current_price <= curr_stop:
-        print(f"🚨 [{symbol}] TRAILING STOP TRIGGERED! Executing market exit.")
+        exit_triggered = True
+        exit_type = "TRAILING_STOP_LOSS"
+    elif current_price >= curr_tp:
+        exit_triggered = True
+        exit_type = "TAKE_PROFIT_LIMIT"
+
+    if exit_triggered:
+        print(f"🚨 [{symbol}] {exit_type} TRIGGERED at {current_price:.2f}!")
         try:
-            trade_amt = TRADE_AMOUNTS.get(symbol, 0.0005)
             timestamp = utc_now_iso()
+            pnl = (current_price - curr_entry) * units
 
             if PAPER_TRADING:
-                order_id = f"SIM_SELL_{int(time.time() * 1000)}"
-                sell_amount = trade_amt
-                proceeds = current_price * sell_amount
+                order_id = f"SIM_{exit_type[:4]}_{int(time.time() * 1000)}"
                 with state_lock:
-                    virtual_balance_usdt += proceeds
-                print(f"📝 [PAPER] Virtual exit filled at ${current_price:.2f}. New balance: ${virtual_balance_usdt:.2f} USDT")
+                    virtual_balance_usdt += (margin_allocated + pnl)
+                print(f"📝 [PAPER] Exit filled at ${current_price:.2f}. PnL: ${pnl:+.2f} USDT. Balance: ${virtual_balance_usdt:.2f}")
             else:
-                base_asset = symbol.split('/')[0]
-                sell_amount = trade_amt
-                try:
-                    balances = exchange.fetch_balance()
-                    available_base = balances['free'].get(base_asset, 0.0)
-                    if available_base > 0:
-                        sell_amount = min(trade_amt, available_base)
-                except Exception as bal_err:
-                    print(f"⚠️ [{symbol}] Balance check error before exit: {bal_err}")
+                params = {}
+                if leverage > 1.0:
+                    params['leverage'] = int(leverage)
 
-                order = exchange.create_market_sell_order(symbol, sell_amount)
+                order = exchange.create_market_sell_order(symbol, units, params)
                 order_id = order.get('id', 'UNKNOWN_ID')
 
-            msg = f"🚨 *EXIT EXECUTED* [{symbol}]: Trailing stop hit at `{current_price:.2f}`. Position liquidated."
+            msg = (
+                f"🚨 *POSITION CLOSED* [{symbol}]\n"
+                f"Reason: `{exit_type}`\n"
+                f"Exit Price: `{current_price:.2f}`\n"
+                f"PnL: `{pnl:+.2f} USDT`\n"
+                f"Leverage: `{leverage}x`"
+            )
             send_telegram_notification(msg)
             log_trade_to_ledger(
-                timestamp, symbol, order_id, 'SELL', 'EXIT',
-                current_price, sell_amount, curr_stop, 'STOP_LOSS_CLOSED'
+                timestamp, symbol, order_id, 'SELL', regime,
+                current_price, units, curr_stop, curr_tp, leverage, exit_type
             )
 
             with state_lock:
@@ -555,40 +725,63 @@ def manage_active_position(symbol, current_price):
                     "position_active": False,
                     "entry_price": 0.0,
                     "trailing_stop": 0.0,
-                    "stop_loss_distance": 0.0
+                    "stop_loss_distance": 0.0,
+                    "take_profit": 0.0,
+                    "leverage": 1.0,
+                    "units": 0.0,
+                    "margin_allocated": 0.0,
+                    "regime": "NONE",
+                    "confidence": 0.0
                 }
             save_state()
 
         except Exception as e:
-            print(f"❌ [{symbol}] Critical failure on exit order: {e}")
+            print(f"❌ [{symbol}] Exit order failure: {e}")
             send_telegram_notification(f"❌ CRITICAL [{symbol}]: Exit order failed: {e}")
 
     elif current_price > curr_entry:
+        # Dynamic Ratchet: Trail stop upward point-for-point preserving risk distance
         new_stop = current_price - risk_dist
         if new_stop > curr_stop:
             with state_lock:
                 positions[symbol]["trailing_stop"] = new_stop
-            print(f"📈 [{symbol}] Trailing stop ratcheted to: {new_stop:.2f}")
+            print(f"📈 [{symbol}] Trailing Stop ratcheted to: {new_stop:.2f}")
             save_state()
 
 # =====================================================================
-# 10. MASTER SIGNAL PROCESSOR (PER-PAIR ORCHESTRATION)
+# 12. MASTER SIGNAL & MULTI-ASSET DISPATCHER
 # =====================================================================
 def execution_orchestrator():
     global positions, virtual_balance_usdt
 
     safety_ok = check_safety_preflight()
 
+    # Step 1: Manage all active positions
     for symbol in SYMBOLS:
         with state_lock:
             is_active = positions[symbol]["position_active"]
 
-        if not safety_ok:
-            if is_active:
-                metrics = analyze_advanced_market(symbol)
-                if metrics:
-                    manage_active_position(symbol, metrics['close'])
-            continue
+        if is_active:
+            metrics = analyze_advanced_market(symbol)
+            if metrics:
+                manage_active_position(symbol, metrics['close'])
+
+    if not safety_ok:
+        return
+
+    # Step 2: Enforce Maximum Concurrent Positions Gate
+    with state_lock:
+        active_count = sum(1 for p in positions.values() if p["position_active"])
+
+    if active_count >= MAX_CONCURRENT_POSITIONS:
+        print(f"⏸️ Max concurrent positions reached ({active_count}/{MAX_CONCURRENT_POSITIONS}). Scanning paused.")
+        return
+
+    # Step 3: Scan candidate watchlist pool for optimal setups
+    for symbol in SYMBOLS:
+        with state_lock:
+            if positions[symbol]["position_active"]:
+                continue
 
         metrics = analyze_advanced_market(symbol)
         if not metrics:
@@ -597,111 +790,97 @@ def execution_orchestrator():
         current_price = metrics['close']
         timestamp = utc_now_iso()
 
-        if is_active:
-            manage_active_position(symbol, current_price)
-            continue
+        regime_signal = None
 
-        mode_label = "PAPER" if PAPER_TRADING else "LIVE"
-        print(f"🔍 [{mode_label} | {symbol}] Scanning | Price: {current_price:.2f} | ADX: {metrics['adx']:.1f}")
-
-        trade_amt = TRADE_AMOUNTS.get(symbol, 0.0005)
-        trade_cost = current_price * trade_amt
-
-        # ------ SIDEWAYS REGIME ENTRY LOGIC ------
+        # Sideways Regime: ADX < 25 and price touching/piercing lower Bollinger Band
         if metrics['adx'] < ADX_TREND_THRESHOLD:
             if current_price <= metrics['bb_lower']:
-                print(f"🟢 [{symbol}] Sideways Floor Signal Found! Entering position.")
-                try:
-                    if PAPER_TRADING:
-                        with state_lock:
-                            if virtual_balance_usdt < trade_cost:
-                                print(f"⚠️ [PAPER] Insufficient virtual balance ({virtual_balance_usdt:.2f}) for trade cost ({trade_cost:.2f})")
-                                continue
-                            virtual_balance_usdt -= trade_cost
-                        order_id = f"SIM_BUY_{int(time.time() * 1000)}"
-                        print(f"📝 [PAPER] Virtual entry filled at ${current_price:.2f}. Balance remaining: ${virtual_balance_usdt:.2f} USDT")
-                    else:
-                        order = exchange.create_market_buy_order(symbol, trade_amt)
-                        order_id = order.get('id', 'UNKNOWN_ID')
-
-                    calculated_dist = metrics['atr'] * ATR_MULTIPLIER
-                    calculated_stop = current_price - calculated_dist
-
-                    with state_lock:
-                        positions[symbol] = {
-                            "position_active": True,
-                            "entry_price": current_price,
-                            "trailing_stop": calculated_stop,
-                            "stop_loss_distance": calculated_dist
-                        }
-                    save_state()
-
-                    msg = (
-                        f"🟢 *TRADE OPENED (SIDEWAYS)*\n"
-                        f"Pair: {symbol}\n"
-                        f"Price: {current_price:.2f}\n"
-                        f"Initial Stop: {calculated_stop:.2f}\n"
-                        f"Buffer: {calculated_dist:.2f}"
-                    )
-                    send_telegram_notification(msg)
-                    log_trade_to_ledger(
-                        timestamp, symbol, order_id, 'BUY', 'SIDEWAYS',
-                        current_price, trade_amt, calculated_stop, 'POSITION_OPEN'
-                    )
-                except Exception as e:
-                    print(f"❌ [{symbol}] Entry order blocked: {e}")
-                    send_telegram_notification(f"❌ [{symbol}] Entry order failure: {e}")
-
-        # ------ SWING BREAKOUT REGIME ENTRY LOGIC ------
+                regime_signal = "SIDEWAYS"
+        # Swing Breakout Regime: ADX >= 25 and extreme oversold momentum
         else:
-            if metrics['rsi'] <= 30:
-                print(f"⚡ [{symbol}] Breakout Momentum Entry Signal! Entering position.")
-                try:
-                    if PAPER_TRADING:
-                        with state_lock:
-                            if virtual_balance_usdt < trade_cost:
-                                print(f"⚠️ [PAPER] Insufficient virtual balance ({virtual_balance_usdt:.2f}) for trade cost ({trade_cost:.2f})")
-                                continue
-                            virtual_balance_usdt -= trade_cost
-                        order_id = f"SIM_BUY_{int(time.time() * 1000)}"
-                        print(f"📝 [PAPER] Virtual entry filled at ${current_price:.2f}. Balance remaining: ${virtual_balance_usdt:.2f} USDT")
-                    else:
-                        order = exchange.create_market_buy_order(symbol, trade_amt)
-                        order_id = order.get('id', 'UNKNOWN_ID')
+            if metrics['rsi'] <= 30.0:
+                regime_signal = "SWING"
 
-                    calculated_dist = metrics['atr'] * ATR_MULTIPLIER
-                    calculated_stop = current_price - calculated_dist
+        if not regime_signal:
+            continue
 
-                    with state_lock:
-                        positions[symbol] = {
-                            "position_active": True,
-                            "entry_price": current_price,
-                            "trailing_stop": calculated_stop,
-                            "stop_loss_distance": calculated_dist
-                        }
-                    save_state()
+        print(f"🔍 [{symbol}] Potential {regime_signal} Setup detected! Evaluating news & risk sizing...")
 
-                    msg = (
-                        f"⚡ *TRADE OPENED (SWING TREND)*\n"
-                        f"Pair: {symbol}\n"
-                        f"Price: {current_price:.2f}\n"
-                        f"Initial Stop: {calculated_stop:.2f}\n"
-                        f"Buffer: {calculated_dist:.2f}"
-                    )
-                    send_telegram_notification(msg)
-                    log_trade_to_ledger(
-                        timestamp, symbol, order_id, 'BUY', 'SWING',
-                        current_price, trade_amt, calculated_stop, 'POSITION_OPEN'
-                    )
-                except Exception as e:
-                    print(f"❌ [{symbol}] Entry order blocked: {e}")
-                    send_telegram_notification(f"❌ [{symbol}] Entry order failure: {e}")
+        # Step 4: News Safety Shield Gate
+        news_ok, news_msg = check_news_safety(symbol)
+        update_engine_status(active_news_status=f"[{symbol}]: {news_msg}")
+        if not news_ok:
+            print(f"🛑 Trade entry blocked by News Shield: {news_msg}")
+            continue
+
+        # Step 5: Dynamic Position Sizing & Adaptive Leverage Calculation
+        plan = calculate_dynamic_entry(symbol, current_price, metrics['atr'], regime_signal, metrics)
+        if not plan:
+            print(f"⚠️ Sizing rejected: Insufficient portfolio margin allocation budget.")
+            continue
+
+        print(
+            f"⚡ Executing {regime_signal} Entry [{symbol}] | Price: {current_price:.2f} | Units: {plan['units']} | "
+            f"Margin: ${plan['margin_required']} | Lev: {plan['leverage']}x | Conf: {plan['confidence']}"
+        )
+
+        try:
+            if PAPER_TRADING:
+                order_id = f"SIM_BUY_{int(time.time() * 1000)}"
+                with state_lock:
+                    virtual_balance_usdt -= plan['margin_required']
+                print(f"📝 [PAPER] Virtual position opened. Margin reserved: ${plan['margin_required']:.2f}")
+            else:
+                params = {}
+                if plan['leverage'] > 1.0:
+                    params['leverage'] = int(plan['leverage'])
+                order = exchange.create_market_buy_order(symbol, plan['units'], params)
+                order_id = order.get('id', 'UNKNOWN_ID')
+
+            with state_lock:
+                positions[symbol] = {
+                    "position_active": True,
+                    "entry_price": current_price,
+                    "trailing_stop": plan['trailing_stop'],
+                    "stop_loss_distance": plan['stop_distance'],
+                    "take_profit": plan['take_profit'],
+                    "leverage": plan['leverage'],
+                    "units": plan['units'],
+                    "margin_allocated": plan['margin_required'],
+                    "regime": regime_signal,
+                    "confidence": plan['confidence']
+                }
+            save_state()
+
+            msg = (
+                f"🟢 *TRADE OPENED ({regime_signal})*\n"
+                f"Symbol: `{symbol}`\n"
+                f"Entry Price: `{current_price:.2f}`\n"
+                f"Size: `{plan['units']}` (${plan['margin_required'] * plan['leverage']:.2f} Notional)\n"
+                f"Adaptive Leverage: `{plan['leverage']}x` (Confidence: {plan['confidence']})\n"
+                f"Initial SL: `{plan['trailing_stop']:.2f}`\n"
+                f"Target TP (1:{RR_RATIO}): `{plan['take_profit']:.2f}`"
+            )
+            send_telegram_notification(msg)
+            log_trade_to_ledger(
+                timestamp, symbol, order_id, 'BUY', regime_signal,
+                current_price, plan['units'], plan['trailing_stop'], plan['take_profit'], plan['leverage'], 'POSITION_OPEN'
+            )
+
+            # Check if concurrent limits reached after this entry
+            with state_lock:
+                active_count = sum(1 for p in positions.values() if p["position_active"])
+            if active_count >= MAX_CONCURRENT_POSITIONS:
+                break
+
+        except Exception as e:
+            print(f"❌ Entry order failed [{symbol}]: {e}")
+            send_telegram_notification(f"❌ Entry blocked [{symbol}]: {e}")
 
 # =====================================================================
-# 11. BACKGROUND TRADING ENGINE
+# 13. BACKGROUND TRADING ENGINE DAEMON
 # =====================================================================
 def trading_engine_loop():
-    """Dedicated worker thread running decoupled from Flask HTTP lifecycles."""
     update_engine_status(
         engine_state="STARTING",
         thread_alive=True,
@@ -712,10 +891,10 @@ def trading_engine_loop():
     )
 
     try:
-        print("♻️ Loading persistent multi-pair state from Upstash...")
+        print("♻️ Loading multi-pair margin state from Upstash...")
         load_state()
 
-        print("🔎 Performing startup reconciliation...")
+        print("🔎 Performing mandatory startup reconciliation...")
         reconcile_state_with_exchange()
 
         update_engine_status(
@@ -724,8 +903,8 @@ def trading_engine_loop():
         )
 
         mode_str = "PAPER TRADING" if PAPER_TRADING else "LIVE CAPITAL"
-        print(f"🚀 Engine Active [{mode_str}]. Monitoring {len(SYMBOLS)} symbols.")
-        send_telegram_notification(f"🚀 Kraken Engine Active [{mode_str}]! Tracking: {', '.join(SYMBOLS)}")
+        print(f"🚀 Quantum Shield Engaged [{mode_str}]. Candidate Pool: {', '.join(SYMBOLS)}")
+        send_telegram_notification(f"🚀 Kraken Bot Engine Active [{mode_str}]! Watching: {', '.join(SYMBOLS)}")
 
         while True:
             update_engine_status(
@@ -753,13 +932,13 @@ def trading_engine_loop():
                 break
             except Exception as e:
                 error_details = f"{type(e).__name__}: {e}"
-                print(f"💥 Global trading loop fault encountered: {error_details}")
+                print(f"💥 Global trading loop fault: {error_details}")
                 traceback.print_exc()
                 update_engine_status(
                     engine_state="RUNNING_WITH_ERRORS",
                     last_error=error_details
                 )
-                send_telegram_notification(f"⚠️ Trading loop exception: {error_details}")
+                send_telegram_notification(f"⚠️ Loop exception: {error_details}")
 
             time.sleep(LOOP_INTERVAL_SECONDS)
 
@@ -772,15 +951,15 @@ def trading_engine_loop():
             last_error=None,
             thread_alive=False
         )
-        send_telegram_notification(f"🛑 *ENGINE STARTUP HALTED*: {e}")
+        send_telegram_notification(f"🛑 *STARTUP HALTED*: {e}")
     except Exception as e:
         error_details = f"{type(e).__name__}: {e}"
-        print(f"💥 Trading engine failed during startup: {error_details}")
+        print(f"💥 Engine failed during startup: {error_details}")
         traceback.print_exc()
         update_engine_status(
             engine_state="STARTUP_FAILED",
             last_error=error_details,
-            halt_reason="Trading engine startup failed.",
+            halt_reason="Startup failure.",
             thread_alive=False,
             startup_reconciled=False
         )
@@ -788,550 +967,296 @@ def trading_engine_loop():
     finally:
         with state_lock:
             engine_status["thread_alive"] = False
-        print("ℹ️ Trading engine thread stopped. Web service remains online.")
+        print("ℹ️ Trading thread stopped. Web server remains active for diagnostics.")
 
 # =====================================================================
-# 12. RENDER WEB SERVICE & OPERATOR TERMINAL UI
+# 14. OPERATOR TERMINAL UI (DARK QUANT DASHBOARD)
 # =====================================================================
 app = Flask(__name__)
 
-DASHBOARD_HTML = r"""
+DASHBOARD_HTML = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, viewport-fit=cover, user-scalable=no">
-<title>REGIME // Kraken Execution Terminal</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,400;0,500;0,600;0,700;0,800;1,500&display=swap" rel="stylesheet">
-<style>
-  :root{
-    --bg:#07090f;
-    --bg-elevated:#0b0f18;
-    --card:#0f1420;
-    --card-hi:#131a29;
-    --border:#1c2536;
-    --border-hi:#2b3752;
-    --text:#e7edf6;
-    --dim:#8792a6;
-    --faint:#4c5568;
-    --mint:#2dd4a8;
-    --mint-dim:rgba(45,212,168,0.12);
-    --rose:#ff5d78;
-    --rose-dim:rgba(255,93,120,0.12);
-    --amber:#f5b93d;
-    --amber-dim:rgba(245,185,61,0.12);
-    --sky:#4fb0ff;
-    --sky-dim:rgba(79,176,255,0.12);
-    --violet:#9a8cfb;
-    --mono:'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
-    --radius:10px;
-  }
-  *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent;}
-  html{background:var(--bg);}
-  body{
-    background:
-      radial-gradient(1200px 500px at 15% -10%, rgba(79,176,255,0.06), transparent 60%),
-      radial-gradient(1000px 600px at 100% 0%, rgba(45,212,168,0.05), transparent 55%),
-      var(--bg);
-    color:var(--text);
-    font-family:var(--mono);
-    -webkit-font-smoothing:antialiased;
-    padding:12px 12px 32px;
-    min-height:100vh;
-  }
-  @media(min-width:720px){ body{padding:20px 24px 40px;} }
-
-  ::selection{background:var(--sky-dim);color:var(--sky);}
-
-  /* ---------- Top bar ---------- */
-  .topbar{
-    display:flex;align-items:center;justify-content:space-between;gap:10px;
-    padding:12px 14px;background:var(--bg-elevated);border:1px solid var(--border);
-    border-radius:var(--radius);margin-bottom:10px;flex-wrap:wrap;
-  }
-  .brand{display:flex;align-items:center;gap:10px;min-width:0;}
-  .brand-mark{
-    width:26px;height:26px;flex:none;border-radius:6px;
-    background:conic-gradient(from 220deg, var(--mint), var(--sky) 45%, var(--violet) 75%, var(--mint));
-    display:flex;align-items:center;justify-content:center;
-    box-shadow:0 0 14px rgba(45,212,168,0.35);
-  }
-  .brand-mark::after{content:'◆';font-size:11px;color:#04070c;font-weight:800;}
-  .brand-text{display:flex;flex-direction:column;line-height:1.15;min-width:0;}
-  .brand-title{font-size:13px;font-weight:800;letter-spacing:1.5px;white-space:nowrap;}
-  .brand-sub{font-size:10px;color:var(--dim);letter-spacing:1px;white-space:nowrap;}
-  .top-right{display:flex;align-items:center;gap:8px;flex-wrap:wrap;}
-  .clock{font-size:12px;color:var(--dim);letter-spacing:0.5px;min-width:76px;text-align:right;}
-
-  .pill{
-    display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border-radius:999px;
-    font-size:10px;font-weight:700;letter-spacing:0.8px;text-transform:uppercase;
-    border:1px solid transparent;white-space:nowrap;
-  }
-  .pill-dot{width:6px;height:6px;border-radius:50%;background:currentColor;animation:blink 1.8s ease-in-out infinite;}
-  @keyframes blink{0%,100%{opacity:1;box-shadow:0 0 0 0 currentColor;}50%{opacity:.35;}}
-  .pill-mint{background:var(--mint-dim);color:var(--mint);border-color:rgba(45,212,168,0.35);}
-  .pill-rose{background:var(--rose-dim);color:var(--rose);border-color:rgba(255,93,120,0.35);}
-  .pill-amber{background:var(--amber-dim);color:var(--amber);border-color:rgba(245,185,61,0.35);}
-  .pill-sky{background:var(--sky-dim);color:var(--sky);border-color:rgba(79,176,255,0.35);}
-  .pill-dim{background:rgba(255,255,255,0.03);color:var(--faint);border-color:var(--border);}
-
-  /* ---------- Ticker tape ---------- */
-  .tape-wrap{
-    background:var(--bg-elevated);border:1px solid var(--border);border-radius:var(--radius);
-    margin-bottom:10px;overflow:hidden;position:relative;
-  }
-  .tape-wrap::before,.tape-wrap::after{
-    content:'';position:absolute;top:0;bottom:0;width:26px;z-index:2;pointer-events:none;
-  }
-  .tape-wrap::before{left:0;background:linear-gradient(90deg,var(--bg-elevated),transparent);}
-  .tape-wrap::after{right:0;background:linear-gradient(-90deg,var(--bg-elevated),transparent);}
-  .tape-track{display:flex;width:max-content;animation:scroll-tape 26s linear infinite;}
-  .tape-track:hover{animation-play-state:paused;}
-  @keyframes scroll-tape{from{transform:translateX(0);}to{transform:translateX(-50%);}}
-  .tape-item{
-    display:flex;align-items:center;gap:8px;padding:9px 18px;font-size:11px;
-    border-right:1px solid var(--border);white-space:nowrap;letter-spacing:0.3px;
-  }
-  .tape-sym{font-weight:700;color:var(--text);}
-  .tape-state{font-weight:700;}
-  .tape-state.on{color:var(--mint);}
-  .tape-state.off{color:var(--faint);}
-  .tape-alloc{color:var(--dim);}
-
-  /* ---------- Stat grid ---------- */
-  .grid{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-bottom:10px;}
-  @media(min-width:640px){.grid{grid-template-columns:repeat(3,1fr);}}
-  @media(min-width:980px){.grid{grid-template-columns:repeat(6,1fr);}}
-  .stat{
-    background:var(--card);border:1px solid var(--border);border-radius:var(--radius);
-    padding:12px 13px;position:relative;overflow:hidden;
-  }
-  .stat-label{font-size:9.5px;color:var(--dim);text-transform:uppercase;letter-spacing:1px;margin-bottom:7px;}
-  .stat-value{font-size:18px;font-weight:700;letter-spacing:0.2px;font-variant-numeric:tabular-nums;}
-  .stat-sub{font-size:10px;color:var(--faint);margin-top:4px;}
-  .stat-value.mint{color:var(--mint);}
-  .stat-value.rose{color:var(--rose);}
-  .stat-value.amber{color:var(--amber);}
-  .stat-value.sky{color:var(--sky);}
-
-  .breaker-bar{display:flex;gap:3px;margin-top:8px;}
-  .breaker-seg{height:4px;flex:1;border-radius:2px;background:var(--border);}
-  .breaker-seg.lit{background:var(--rose);}
-
-  /* ---------- Panels ---------- */
-  .panel{
-    background:var(--card);border:1px solid var(--border);border-radius:var(--radius);
-    margin-bottom:10px;overflow:hidden;
-  }
-  .panel-head{
-    display:flex;align-items:center;justify-content:space-between;
-    padding:11px 14px;border-bottom:1px solid var(--border);
-  }
-  .panel-title{font-size:10.5px;text-transform:uppercase;letter-spacing:1.2px;color:var(--dim);font-weight:700;}
-  .panel-meta{font-size:10px;color:var(--faint);}
-
-  .alert-box{
-    margin:12px 14px;padding:10px 12px;border-radius:8px;font-size:11.5px;line-height:1.5;
-    background:var(--rose-dim);border:1px solid rgba(255,93,120,0.35);color:#ffc3ce;
-  }
-  .alert-box b{color:var(--rose);}
-
-  /* ---------- Blotter table ---------- */
-  .table-scroll{overflow-x:auto;}
-  table{width:100%;border-collapse:collapse;font-size:12px;min-width:640px;}
-  th{
-    text-align:left;padding:9px 14px;font-size:9.5px;text-transform:uppercase;
-    letter-spacing:0.8px;color:var(--faint);border-bottom:1px solid var(--border);
-    background:var(--bg-elevated);white-space:nowrap;
-  }
-  td{padding:11px 14px;border-bottom:1px solid var(--border);white-space:nowrap;font-variant-numeric:tabular-nums;}
-  tr:last-child td{border-bottom:none;}
-  .sym-cell{display:flex;align-items:center;gap:8px;font-weight:700;}
-  .sym-dot{width:7px;height:7px;border-radius:50%;flex:none;}
-  .sym-dot.on{background:var(--mint);box-shadow:0 0 8px var(--mint);}
-  .sym-dot.off{background:var(--faint);}
-  .state-open{color:var(--mint);font-weight:700;}
-  .state-flat{color:var(--faint);}
-  .risk-cell{display:flex;align-items:center;gap:8px;}
-  .risk-track{width:64px;height:5px;border-radius:3px;background:var(--border);overflow:hidden;flex:none;}
-  .risk-fill{height:100%;background:linear-gradient(90deg,var(--amber),var(--rose));}
-  .risk-pct{color:var(--dim);font-size:11px;min-width:38px;}
-  .empty-row td{text-align:center;color:var(--faint);padding:20px;}
-
-  /* ---------- Event log ---------- */
-  .log-body{max-height:220px;overflow-y:auto;padding:6px 0;}
-  .log-row{
-    display:flex;gap:10px;padding:6px 14px;font-size:11px;border-bottom:1px solid rgba(255,255,255,0.02);
-  }
-  .log-time{color:var(--faint);flex:none;width:64px;}
-  .log-msg{color:var(--dim);word-break:break-word;}
-  .log-msg.mint{color:var(--mint);}
-  .log-msg.rose{color:var(--rose);}
-  .log-msg.amber{color:var(--amber);}
-  .log-cursor{display:inline-block;width:7px;height:12px;background:var(--mint);margin-left:14px;vertical-align:-2px;animation:blink 1s steps(2) infinite;}
-
-  /* ---------- Raw JSON ---------- */
-  .raw-toggle{
-    background:none;border:none;color:var(--sky);font-family:var(--mono);font-size:10.5px;
-    cursor:pointer;padding:11px 14px;text-transform:uppercase;letter-spacing:0.8px;font-weight:700;
-    display:flex;align-items:center;gap:6px;width:100%;justify-content:space-between;
-  }
-  .raw-toggle .chev{transition:transform .2s ease;color:var(--faint);}
-  .raw-toggle.open .chev{transform:rotate(90deg);}
-  .raw-box{
-    display:none;background:#04060a;border-top:1px solid var(--border);
-    padding:12px 14px;font-size:10.5px;color:var(--dim);overflow-x:auto;
-    white-space:pre-wrap;word-break:break-all;max-height:280px;overflow-y:auto;
-  }
-  .raw-box.open{display:block;}
-
-  .footer{
-    display:flex;justify-content:space-between;flex-wrap:wrap;gap:6px;
-    font-size:10px;color:var(--faint);padding:6px 4px 0;letter-spacing:0.3px;
-  }
-</style>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Kraken Dynamic Regime Terminal</title>
+  <style>
+    :root {
+      --bg: #090d16;
+      --card: #111726;
+      --card-alt: #161f33;
+      --border: #1f2b45;
+      --text: #e6edf3;
+      --muted: #8b949e;
+      --green: #2ea043;
+      --green-glow: rgba(46, 160, 67, 0.15);
+      --red: #f85149;
+      --red-glow: rgba(248, 81, 73, 0.15);
+      --blue: #58a6ff;
+      --amber: #d29922;
+      --amber-glow: rgba(210, 153, 34, 0.15);
+      --font-mono: ui-monospace, SFMono-Regular, "SF Pro Text", Menlo, Monaco, Consolas, monospace;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font-mono);
+      padding: 16px;
+      line-height: 1.4;
+      -webkit-font-smoothing: antialiased;
+    }
+    .header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 14px 18px;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      margin-bottom: 16px;
+    }
+    .title {
+      font-size: 15px;
+      font-weight: 700;
+      letter-spacing: 0.5px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    .badge-running { background: var(--green-glow); color: var(--green); border: 1px solid var(--green); }
+    .badge-halted { background: var(--red-glow); color: var(--red); border: 1px solid var(--red); }
+    .badge-paper { background: var(--amber-glow); color: var(--amber); border: 1px solid var(--amber); }
+    .badge-live { background: var(--green-glow); color: var(--green); border: 1px solid var(--green); }
+    .dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: currentColor;
+      animation: pulse 2s infinite ease-in-out;
+    }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 14px;
+    }
+    .card-label {
+      font-size: 11px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 6px;
+    }
+    .card-value {
+      font-size: 20px;
+      font-weight: 700;
+      color: var(--text);
+    }
+    .section-title {
+      font-size: 13px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: var(--muted);
+      margin-bottom: 10px;
+      font-weight: 600;
+    }
+    .table-container {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow-x: auto;
+      margin-bottom: 16px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      text-align: left;
+      font-size: 13px;
+    }
+    th, td {
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--border);
+      white-space: nowrap;
+    }
+    th {
+      color: var(--muted);
+      font-weight: 600;
+      font-size: 11px;
+      text-transform: uppercase;
+    }
+    tr:last-child td { border-bottom: none; }
+    .pos-open { color: var(--green); font-weight: 700; }
+    .pos-flat { color: var(--muted); }
+    .raw-box {
+      background: #05080f;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 12px;
+      font-size: 11px;
+      color: var(--muted);
+      overflow-x: auto;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+    .footer {
+      display: flex;
+      justify-content: space-between;
+      font-size: 11px;
+      color: var(--muted);
+      margin-top: 16px;
+      padding: 0 4px;
+    }
+  </style>
 </head>
 <body>
-
-  <div class="topbar">
-    <div class="brand">
-      <div class="brand-mark"></div>
-      <div class="brand-text">
-        <span class="brand-title">REGIME ENGINE</span>
-        <span class="brand-sub">KRAKEN &middot; MULTI-PAIR EXECUTION</span>
-      </div>
+  <div class="header">
+    <div class="title">
+      <span>KRAKEN QUANT ENGINE</span>
+      <span id="badge-mode" class="badge badge-paper"><span class="dot"></span>PAPER</span>
+      <span id="badge-state" class="badge badge-running"><span class="dot"></span>RUNNING</span>
     </div>
-    <div class="top-right">
-      <span id="badge-mode" class="pill pill-amber"><span class="pill-dot"></span>PAPER</span>
-      <span id="badge-state" class="pill pill-mint"><span class="pill-dot"></span>SYNCING</span>
-      <span class="clock" id="local-clock">--:--:--</span>
-    </div>
-  </div>
-
-  <div class="tape-wrap">
-    <div class="tape-track" id="tape-track">
-      <div class="tape-item"><span class="tape-sym">CONNECTING&hellip;</span></div>
-    </div>
+    <div style="font-size: 12px; color: var(--muted);" id="last-updated">--:--:--</div>
   </div>
 
   <div class="grid">
-    <div class="stat">
-      <div class="stat-label">Capital</div>
-      <div class="stat-value mint" id="val-balance">&mdash;</div>
-      <div class="stat-sub" id="val-balance-sub">&nbsp;</div>
+    <div class="card">
+      <div class="card-label">Virtual Capital</div>
+      <div class="card-value" id="val-balance">$0.00</div>
     </div>
-    <div class="stat">
-      <div class="stat-label">Uptime</div>
-      <div class="stat-value" id="val-uptime">00:00:00</div>
-      <div class="stat-sub">since boot</div>
+    <div class="card">
+      <div class="card-label">Margin In Use</div>
+      <div class="card-value" id="val-margin">$0.00</div>
     </div>
-    <div class="stat">
-      <div class="stat-label">Last Loop</div>
-      <div class="stat-value sky" id="val-loopage">&mdash;</div>
-      <div class="stat-sub" id="val-loop-abs">&nbsp;</div>
+    <div class="card">
+      <div class="card-label">Risk Per Trade</div>
+      <div class="card-value" id="val-risk">1.5%</div>
     </div>
-    <div class="stat">
-      <div class="stat-label">Circuit Breaker</div>
-      <div class="stat-value" id="val-failures">0 / 3</div>
-      <div class="breaker-bar" id="breaker-bar"></div>
-    </div>
-    <div class="stat">
-      <div class="stat-label">Timeframe</div>
-      <div class="stat-value" id="val-timeframe">&mdash;</div>
-      <div class="stat-sub">ADX &middot; ATR regime split</div>
-    </div>
-    <div class="stat">
-      <div class="stat-label">Persistence</div>
-      <div class="stat-value amber" id="val-persist" style="font-size:13px;">&mdash;</div>
-      <div class="stat-sub" id="val-reconciled">&nbsp;</div>
+    <div class="card">
+      <div class="card-label">News Safety Shield</div>
+      <div class="card-value" id="val-news" style="font-size: 14px; margin-top: 4px;">MONITORING</div>
     </div>
   </div>
 
-  <div class="panel" id="alert-panel" style="display:none;">
-    <div class="panel-head"><span class="panel-title">Fault Report</span></div>
-    <div class="alert-box" id="alert-box"></div>
+  <div class="section-title">Dynamic Candidate Watchlist & Active Positions</div>
+  <div class="table-container">
+    <table>
+      <thead>
+        <tr>
+          <th>Symbol</th>
+          <th>State</th>
+          <th>Regime</th>
+          <th>Leverage</th>
+          <th>Units</th>
+          <th>Margin</th>
+          <th>Entry</th>
+          <th>Trailing SL</th>
+          <th>Target TP (1:2)</th>
+        </tr>
+      </thead>
+      <tbody id="positions-tbody">
+        <tr><td colspan="9" style="color: var(--muted); text-align: center;">Scanning candidate pool...</td></tr>
+      </tbody>
+    </table>
   </div>
 
-  <div class="panel">
-    <div class="panel-head">
-      <span class="panel-title">Position Blotter</span>
-      <span class="panel-meta" id="blotter-meta">&mdash;</span>
-    </div>
-    <div class="table-scroll">
-      <table>
-        <thead>
-          <tr>
-            <th>Symbol</th><th>State</th><th>Alloc</th><th>Entry</th><th>Stop</th><th>Buffer</th><th>Risk</th>
-          </tr>
-        </thead>
-        <tbody id="positions-tbody">
-          <tr class="empty-row"><td colspan="7">Awaiting telemetry&hellip;</td></tr>
-        </tbody>
-      </table>
-    </div>
-  </div>
-
-  <div class="panel">
-    <div class="panel-head">
-      <span class="panel-title">Event Log</span>
-      <span class="panel-meta">local &middot; session</span>
-    </div>
-    <div class="log-body" id="log-body">
-      <div class="log-row"><span class="log-time">--:--:--</span><span class="log-msg">Awaiting first poll<span class="log-cursor"></span></span></div>
-    </div>
-  </div>
-
-  <div class="panel">
-    <button class="raw-toggle" id="raw-toggle">
-      <span>Raw Snapshot &middot; /status</span>
-      <span class="chev">&rsaquo;</span>
-    </button>
-    <pre class="raw-box" id="raw-state"></pre>
-  </div>
+  <div class="section-title">Telemetry Snapshot</div>
+  <pre class="raw-box" id="raw-state">Fetching telemetrics...</pre>
 
   <div class="footer">
-    <span>GET /status &middot; GET /health</span>
-    <span>poll 3s &middot; local clocks 1s</span>
+    <span>API: /status</span>
+    <span>Auto-refresh: 3s</span>
   </div>
 
-<script>
-(function(){
-  var lastData = null;
-  var lastFetchOk = false;
-  var prevState = null, prevError = null, prevHalt = null;
-  var logMax = 40;
+  <script>
+    async function updateDashboard() {
+      try {
+        const res = await fetch('/status');
+        const data = await res.json();
 
-  function pad(n){ return String(n).padStart(2,'0'); }
+        const badgeMode = document.getElementById('badge-mode');
+        badgeMode.textContent = data.mode === 'PAPER_TRADING' ? 'PAPER SIMULATION' : 'LIVE CAPITAL';
+        badgeMode.className = 'badge ' + (data.mode === 'PAPER_TRADING' ? 'badge-paper' : 'badge-live');
 
-  function fmtClock(d){
-    return pad(d.getHours())+':'+pad(d.getMinutes())+':'+pad(d.getSeconds());
-  }
+        const badgeState = document.getElementById('badge-state');
+        badgeState.textContent = data.engine_state;
+        badgeState.className = 'badge ' + (data.engine_state === 'RUNNING' ? 'badge-running' : 'badge-halted');
 
-  function fmtDuration(ms){
-    if (ms < 0) ms = 0;
-    var s = Math.floor(ms/1000);
-    var h = Math.floor(s/3600); s -= h*3600;
-    var m = Math.floor(s/60); s -= m*60;
-    return pad(h)+':'+pad(m)+':'+pad(s);
-  }
+        document.getElementById('last-updated').textContent = new Date().toLocaleTimeString();
 
-  function fmtAgo(ms){
-    if (ms < 0) ms = 0;
-    var s = Math.floor(ms/1000);
-    if (s < 60) return s + 's ago';
-    var m = Math.floor(s/60);
-    if (m < 60) return m + 'm ' + (s%60) + 's ago';
-    var h = Math.floor(m/60);
-    return h + 'h ' + (m%60) + 'm ago';
-  }
+        const bal = data.virtual_balance_usdt !== null ? '$' + Number(data.virtual_balance_usdt).toFixed(2) : 'LIVE ACCOUNT';
+        document.getElementById('val-balance').textContent = bal;
+        document.getElementById('val-margin').textContent = '$' + Number(data.total_margin_allocated || 0).toFixed(2);
+        document.getElementById('val-risk').textContent = (data.risk_pct_per_trade * 100).toFixed(1) + '% / 1:' + (data.rr_ratio || 2);
+        document.getElementById('val-news').textContent = data.active_news_status || 'MONITORING';
 
-  function addLog(msg, cls){
-    var body = document.getElementById('log-body');
-    var row = document.createElement('div');
-    row.className = 'log-row';
-    row.innerHTML = '<span class="log-time">'+fmtClock(new Date())+'</span><span class="log-msg '+(cls||'')+'">'+msg+'</span>';
-    body.insertBefore(row, body.firstChild);
-    while (body.children.length > logMax) body.removeChild(body.lastChild);
-  }
+        const tbody = document.getElementById('positions-tbody');
+        tbody.innerHTML = '';
+        for (const [sym, pos] of Object.entries(data.positions || {})) {
+          const row = document.createElement('tr');
+          const isAct = pos.position_active;
+          const posCell = isAct ? '<span class="pos-open">OPEN</span>' : '<span class="pos-flat">SCANNING</span>';
+          const reg = isAct ? pos.regime : '--';
+          const lev = isAct ? pos.leverage + 'x' : '--';
+          const units = isAct ? pos.units : '--';
+          const marg = isAct ? '$' + Number(pos.margin_allocated).toFixed(2) : '--';
+          const entry = isAct ? '$' + Number(pos.entry_price).toFixed(2) : '--';
+          const stop = isAct ? '$' + Number(pos.trailing_stop).toFixed(2) : '--';
+          const tp = isAct ? '$' + Number(pos.take_profit).toFixed(2) : '--';
 
-  function setPill(el, text, variant){
-    el.className = 'pill pill-' + variant;
-    el.innerHTML = '<span class="pill-dot"></span>' + text;
-  }
+          row.innerHTML = `
+            <td><strong>${sym}</strong></td>
+            <td>${posCell}</td>
+            <td>${reg}</td>
+            <td>${lev}</td>
+            <td>${units}</td>
+            <td>${marg}</td>
+            <td>${entry}</td>
+            <td>${stop}</td>
+            <td>${tp}</td>
+          `;
+          tbody.appendChild(row);
+        }
 
-  function renderTape(data){
-    var track = document.getElementById('tape-track');
-    var syms = data.tracked_symbols || [];
-    var positions = data.positions || {};
-    var amounts = data.trade_amounts || {};
-    if (!syms.length){ track.innerHTML = '<div class="tape-item"><span class="tape-sym">NO SYMBOLS TRACKED</span></div>'; return; }
-
-    function buildItems(){
-      return syms.map(function(sym){
-        var p = positions[sym] || {};
-        var active = !!p.position_active;
-        var alloc = amounts[sym] !== undefined ? amounts[sym] : '--';
-        return '<div class="tape-item">'
-          + '<span class="tape-sym">'+sym+'</span>'
-          + '<span class="tape-state '+(active?'on':'off')+'">'+(active?'OPEN':'FLAT')+'</span>'
-          + '<span class="tape-alloc">'+alloc+' sz</span>'
-          + '</div>';
-      }).join('');
-    }
-    // duplicate the sequence so the CSS 50%-translate loop is seamless
-    track.innerHTML = buildItems() + buildItems();
-  }
-
-  function renderPositions(data){
-    var tbody = document.getElementById('positions-tbody');
-    var positions = data.positions || {};
-    var amounts = data.trade_amounts || {};
-    var syms = data.tracked_symbols || Object.keys(positions);
-    var meta = document.getElementById('blotter-meta');
-    var openCount = syms.filter(function(s){ return positions[s] && positions[s].position_active; }).length;
-    meta.textContent = openCount + ' open / ' + syms.length + ' tracked';
-
-    if (!syms.length){
-      tbody.innerHTML = '<tr class="empty-row"><td colspan="7">No symbols tracked</td></tr>';
-      return;
-    }
-
-    tbody.innerHTML = syms.map(function(sym){
-      var p = positions[sym] || {position_active:false, entry_price:0, trailing_stop:0, stop_loss_distance:0};
-      var active = !!p.position_active;
-      var alloc = amounts[sym] !== undefined ? amounts[sym] : '--';
-      var entry = active ? '$'+Number(p.entry_price).toFixed(2) : '&mdash;';
-      var stop = active ? '$'+Number(p.trailing_stop).toFixed(2) : '&mdash;';
-      var buf = active ? '$'+Number(p.stop_loss_distance).toFixed(2) : '&mdash;';
-      var riskPct = (active && p.entry_price) ? (p.stop_loss_distance / p.entry_price * 100) : 0;
-      var riskPctClamped = Math.max(0, Math.min(100, riskPct * 10)); // amplify for visibility on a small bar
-      var riskCell = active
-        ? '<div class="risk-cell"><div class="risk-track"><div class="risk-fill" style="width:'+riskPctClamped.toFixed(0)+'%"></div></div><span class="risk-pct">'+riskPct.toFixed(2)+'%</span></div>'
-        : '<span class="risk-pct">&mdash;</span>';
-
-      return '<tr>'
-        + '<td><div class="sym-cell"><span class="sym-dot '+(active?'on':'off')+'"></span>'+sym+'</div></td>'
-        + '<td><span class="'+(active?'state-open':'state-flat')+'">'+(active?'OPEN':'FLAT')+'</span></td>'
-        + '<td>'+alloc+'</td>'
-        + '<td>'+entry+'</td>'
-        + '<td>'+stop+'</td>'
-        + '<td>'+buf+'</td>'
-        + '<td>'+riskCell+'</td>'
-        + '</tr>';
-    }).join('');
-  }
-
-  function renderBreaker(fails){
-    fails = fails || 0;
-    var bar = document.getElementById('breaker-bar');
-    var html = '';
-    for (var i=0;i<3;i++){
-      html += '<div class="breaker-seg '+(i<fails?'lit':'')+'"></div>';
-    }
-    bar.innerHTML = html;
-    var valEl = document.getElementById('val-failures');
-    valEl.textContent = fails + ' / 3';
-    valEl.className = 'stat-value ' + (fails >= 3 ? 'rose' : fails > 0 ? 'amber' : '');
-  }
-
-  function renderAlert(data){
-    var panel = document.getElementById('alert-panel');
-    var box = document.getElementById('alert-box');
-    var msg = data.halt_reason || data.last_error;
-    if (msg){
-      panel.style.display = 'block';
-      var label = data.halt_reason ? 'HALTED' : 'LAST ERROR';
-      box.innerHTML = '<b>'+label+':</b>&nbsp;' + String(msg).replace(/</g,'&lt;');
-    } else {
-      panel.style.display = 'none';
-    }
-  }
-
-  function render(data){
-    lastData = data;
-    lastFetchOk = true;
-
-    var isPaper = data.mode === 'PAPER_TRADING';
-    setPill(document.getElementById('badge-mode'), isPaper ? 'PAPER' : 'LIVE', isPaper ? 'amber' : 'mint');
-
-    var state = data.engine_state || 'UNKNOWN';
-    var stateVariant = 'mint';
-    if (state === 'HALTED' || state === 'STARTUP_FAILED') stateVariant = 'rose';
-    else if (state === 'RUNNING_WITH_ERRORS') stateVariant = 'amber';
-    else if (state === 'STARTING' || state === 'NOT_STARTED') stateVariant = 'sky';
-    setPill(document.getElementById('badge-state'), state.replace(/_/g,' '), stateVariant);
-
-    var balEl = document.getElementById('val-balance');
-    var balSub = document.getElementById('val-balance-sub');
-    if (data.virtual_balance_usdt !== null && data.virtual_balance_usdt !== undefined){
-      balEl.textContent = '$' + Number(data.virtual_balance_usdt).toFixed(2);
-      balSub.textContent = 'virtual USDT';
-    } else {
-      balEl.textContent = 'LIVE';
-      balSub.textContent = 'exchange balance';
-    }
-
-    document.getElementById('val-timeframe').textContent = data.timeframe || '--';
-    document.getElementById('val-persist').textContent = data.persistence_backend || '--';
-    document.getElementById('val-reconciled').textContent = data.startup_reconciled ? 'reconciled ✓' : 'not reconciled';
-
-    renderBreaker(data.consecutive_failures);
-    renderAlert(data);
-    renderTape(data);
-    renderPositions(data);
-
-    document.getElementById('raw-state').textContent = JSON.stringify(data, null, 2);
-
-    // event log on meaningful transitions
-    if (prevState !== null && prevState !== state){
-      addLog('engine_state ' + prevState + ' &rarr; ' + state, stateVariant === 'rose' ? 'rose' : stateVariant === 'amber' ? 'amber' : 'mint');
-    } else if (prevState === null){
-      addLog('telemetry link established &middot; state=' + state, 'mint');
-    }
-    if (data.last_error && data.last_error !== prevError){
-      addLog('error: ' + String(data.last_error), 'rose');
-    }
-    if (data.halt_reason && data.halt_reason !== prevHalt){
-      addLog('halt: ' + String(data.halt_reason), 'rose');
-    }
-    prevState = state; prevError = data.last_error; prevHalt = data.halt_reason;
-  }
-
-  function tickLocalClocks(){
-    document.getElementById('local-clock').textContent = fmtClock(new Date());
-
-    if (lastData && lastData.startup_timestamp){
-      var boot = new Date(lastData.startup_timestamp).getTime();
-      document.getElementById('val-uptime').textContent = fmtDuration(Date.now() - boot);
-    }
-    if (lastData && lastData.last_loop_timestamp){
-      var loop = new Date(lastData.last_loop_timestamp).getTime();
-      document.getElementById('val-loopage').textContent = fmtAgo(Date.now() - loop);
-      document.getElementById('val-loop-abs').textContent = new Date(lastData.last_loop_timestamp).toLocaleTimeString();
-    }
-  }
-
-  async function poll(){
-    try{
-      var res = await fetch('/status', {cache:'no-store'});
-      var data = await res.json();
-      render(data);
-    } catch(err){
-      if (lastFetchOk){
-        addLog('telemetry link lost', 'rose');
+        document.getElementById('raw-state').textContent = JSON.stringify(data, null, 2);
+      } catch (err) {
+        document.getElementById('badge-state').textContent = 'DISCONNECTED';
+        document.getElementById('badge-state').className = 'badge badge-halted';
       }
-      lastFetchOk = false;
-      setPill(document.getElementById('badge-state'), 'DISCONNECTED', 'rose');
     }
-  }
 
-  document.getElementById('raw-toggle').addEventListener('click', function(){
-    var box = document.getElementById('raw-state');
-    var open = box.classList.toggle('open');
-    this.classList.toggle('open', open);
-  });
-
-  poll();
-  setInterval(poll, 3000);
-  setInterval(tickLocalClocks, 1000);
-  tickLocalClocks();
-})();
-</script>
+    updateDashboard();
+    setInterval(updateDashboard, 3000);
+  </script>
 </body>
 </html>
 """
 
 @app.route("/", methods=["GET"])
 def dashboard():
-    """Operator terminal dashboard rendered as clean dark-mode HTML."""
     return render_template_string(DASHBOARD_HTML)
 
 @app.route("/health", methods=["GET"])
 def health():
-    """Zero-dependency keep-alive endpoint for external uptime monitors."""
     return jsonify({
         "status": "ok",
         "service": "kraken-hybrid-regime-bot-multipair",
@@ -1341,14 +1266,12 @@ def health():
 
 @app.route("/status", methods=["GET"])
 def status():
-    """Diagnostic telemetry endpoint exposing thread-safe state cache."""
     return jsonify(get_status_snapshot()), 200
 
 # =====================================================================
-# 13. APPLICATION BOOTSTRAP
+# 15. APPLICATION BOOTSTRAP
 # =====================================================================
 def start_trading_thread():
-    """Spawns the background trading daemon."""
     active_threads = [
         t for t in threading.enumerate()
         if t.name == "KrakenTradingEngine" and t.is_alive()
@@ -1363,14 +1286,14 @@ def start_trading_thread():
         daemon=True
     )
     engine_thread.start()
-    print("🧵 Background multi-pair trading engine thread started.")
+    print("🧵 Dynamic Multi-Asset Risk Engine thread started.")
 
 if __name__ == "__main__":
-    print(f"🌐 Starting Kraken Multi-Pair Web Service on 0.0.0.0:{SERVER_PORT}")
-    print(f"⚙️ Execution Mode: {'PAPER TRADING (Simulated)' if PAPER_TRADING else 'LIVE (Real Capital)'}")
-    print("💻 Operator Dashboard: /")
-    print("📡 Health endpoint: /health")
-    print("📊 Status API: /status")
+    print(f"🌐 Starting Kraken Multi-Asset Web Service on 0.0.0.0:{SERVER_PORT}")
+    print(f"⚙️ Mode: {'PAPER TRADING (Simulated)' if PAPER_TRADING else 'LIVE CAPITAL'}")
+    print("💻 Terminal UI: /")
+    print("📡 Health Check: /health")
+    print("📊 Telemetry API: /status")
 
     start_trading_thread()
 

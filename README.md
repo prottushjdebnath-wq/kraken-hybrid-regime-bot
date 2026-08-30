@@ -1,1 +1,0 @@
-# kraken-hybrid-regime-bot

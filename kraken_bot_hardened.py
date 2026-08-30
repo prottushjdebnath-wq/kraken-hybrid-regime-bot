@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 import ccxt
 import pandas as pd
 import requests
-from flask import Flask, jsonify, render_template_string
+from flask import Flask, jsonify, render_template_string, request
 
 # =====================================================================
 # 1. ENVIRONMENT CONFIGURATION & VALIDATION
@@ -56,6 +56,7 @@ MAX_FAILURES_ALLOWED = int(os.environ.get("MAX_FAILURES_ALLOWED", "3"))
 MIN_BALANCE_USDT = float(os.environ.get("MIN_BALANCE_USDT", "10.0"))
 
 LOOP_INTERVAL_SECONDS = int(os.environ.get("LOOP_INTERVAL_SECONDS", "300"))
+LIVE_PRICE_REFRESH_SECONDS = int(os.environ.get("LIVE_PRICE_REFRESH_SECONDS", "5"))
 SERVER_PORT = int(os.environ.get("PORT", "10000"))
 
 CSV_FILE_PATH = "dual_exchange_trade_ledger.csv"
@@ -121,8 +122,17 @@ positions = {}
 active_candidate_universe = {}
 top_scanned_opportunities = []
 
+# manual_watchlist schema: { "binance": ["BTC/USDT", ...], "kraken": [...] }
+manual_watchlist = {ex: [] for ex in exchanges.keys()}
+
+# live_prices schema: { "BINANCE:BTC/USDT": {"price": 64213.5, "ts": iso_string} }
+live_prices = {}
+
 virtual_balance_usdt = PAPER_INITIAL_BALANCE
 consecutive_failures = 0
+
+realized_pnl_total = 0.0
+realized_pnl_by_exchange = {ex: 0.0 for ex in exchanges.keys()}
 
 engine_status = {
     "venues": [e.upper() for e in exchanges.keys()],
@@ -133,6 +143,7 @@ engine_status = {
     "last_error": None,
     "halt_reason": None,
     "thread_alive": False,
+    "live_feed_alive": False,
     "startup_reconciled": False,
     "startup_timestamp": None,
     "paper_trading": PAPER_TRADING,
@@ -151,6 +162,37 @@ def update_engine_status(**kwargs):
 def get_status_snapshot():
     with state_lock:
         total_margin_used = sum(p["margin_allocated"] for p in positions.values() if p.get("position_active", False))
+
+        active_positions_out = {}
+        for key, data in positions.items():
+            if not data.get("position_active", False):
+                continue
+            pos_copy = dict(data)
+            live = live_prices.get(key)
+            current_price = live["price"] if live else pos_copy.get("entry_price", 0.0)
+            entry_price = pos_copy.get("entry_price", 0.0)
+            leverage = pos_copy.get("leverage", 1.0) or 1.0
+            units = pos_copy.get("units", 0.0)
+
+            pos_copy["current_price"] = current_price
+            pos_copy["price_updated_at"] = live["ts"] if live else None
+            pos_copy["unrealized_pnl"] = round((current_price - entry_price) * units, 2)
+            pos_copy["unrealized_pnl_pct"] = round(
+                ((current_price / entry_price) - 1.0) * leverage * 100.0, 2
+            ) if entry_price else 0.0
+            active_positions_out[key] = pos_copy
+
+        opportunities_out = []
+        for item in top_scanned_opportunities:
+            item_copy = {k: v for k, v in item.items() if k != "metrics"}
+            live = live_prices.get(item.get("composite_key", ""))
+            if live:
+                item_copy["live_price"] = live["price"]
+                item_copy["live_updated_at"] = live["ts"]
+            opportunities_out.append(item_copy)
+
+        total_unrealized = round(sum(p["unrealized_pnl"] for p in active_positions_out.values()), 2)
+
         snapshot = dict(engine_status)
         snapshot.update({
             "mode": "PAPER_TRADING" if PAPER_TRADING else "LIVE_OR_TESTNET",
@@ -158,13 +200,33 @@ def get_status_snapshot():
             "total_margin_allocated": round(total_margin_used, 2),
             "scanner_mode": TRADING_SYMBOLS_MODE,
             "candidate_universe_by_venue": active_candidate_universe,
+            "manual_watchlist": {k: list(v) for k, v in manual_watchlist.items()},
             "timeframe": TIMEFRAME,
-            "positions": {key: dict(data) for key, data in positions.items() if data.get("position_active", False)},
-            "top_opportunities": list(top_scanned_opportunities),
+            "positions": active_positions_out,
+            "top_opportunities": opportunities_out,
             "consecutive_failures": consecutive_failures,
             "risk_pct_per_trade": RISK_PCT_PER_TRADE,
             "rr_ratio": RR_RATIO,
-            "max_leverage": MAX_LEVERAGE
+            "max_leverage": MAX_LEVERAGE,
+            "total_unrealized_pnl": total_unrealized,
+            "realized_pnl_total": round(realized_pnl_total, 2),
+            "realized_pnl_by_exchange": {k: round(v, 2) for k, v in realized_pnl_by_exchange.items()},
+            "bot_parameters": {
+                "risk_pct_per_trade": RISK_PCT_PER_TRADE,
+                "rr_ratio": RR_RATIO,
+                "min_leverage": MIN_LEVERAGE,
+                "max_leverage": MAX_LEVERAGE,
+                "max_concurrent_positions": MAX_CONCURRENT_POSITIONS,
+                "max_portfolio_margin_pct": MAX_PORTFOLIO_MARGIN_PCT,
+                "adx_trend_threshold": ADX_TREND_THRESHOLD,
+                "atr_multiplier": ATR_MULTIPLIER,
+                "timeframe": TIMEFRAME,
+                "scan_quote_currency": SCAN_QUOTE_CURRENCY,
+                "scan_top_liquid_pairs": SCAN_TOP_LIQUID_PAIRS,
+                "loop_interval_seconds": LOOP_INTERVAL_SECONDS,
+                "live_price_refresh_seconds": LIVE_PRICE_REFRESH_SECONDS,
+                "trading_symbols_mode": TRADING_SYMBOLS_MODE
+            }
         })
     return snapshot
 
@@ -193,6 +255,9 @@ def save_state():
             'virtual_balance_usdt': virtual_balance_usdt,
             'positions': active_pos_only,
             'consecutive_failures': consecutive_failures,
+            'manual_watchlist': {k: list(v) for k, v in manual_watchlist.items()},
+            'realized_pnl_total': realized_pnl_total,
+            'realized_pnl_by_exchange': dict(realized_pnl_by_exchange),
             'last_updated': utc_now_iso()
         }
 
@@ -215,6 +280,7 @@ def save_state():
 
 def load_state():
     global positions, virtual_balance_usdt, consecutive_failures
+    global manual_watchlist, realized_pnl_total, realized_pnl_by_exchange
 
     recovered_raw = None
 
@@ -247,6 +313,19 @@ def load_state():
             if PAPER_TRADING and 'virtual_balance_usdt' in state:
                 virtual_balance_usdt = float(state['virtual_balance_usdt'])
 
+            recovered_watchlist = state.get('manual_watchlist', {})
+            for ex_name in exchanges.keys():
+                manual_watchlist.setdefault(ex_name, [])
+                if ex_name in recovered_watchlist:
+                    manual_watchlist[ex_name] = list(dict.fromkeys(recovered_watchlist[ex_name]))
+
+            realized_pnl_total = float(state.get('realized_pnl_total', 0.0))
+            recovered_realized_by_ex = state.get('realized_pnl_by_exchange', {})
+            for ex_name in exchanges.keys():
+                realized_pnl_by_exchange.setdefault(ex_name, 0.0)
+                if ex_name in recovered_realized_by_ex:
+                    realized_pnl_by_exchange[ex_name] = float(recovered_realized_by_ex[ex_name])
+
             saved_positions = state.get('positions', {})
             for key, p in saved_positions.items():
                 is_active = bool(p.get('position_active', False))
@@ -261,6 +340,7 @@ def load_state():
                 marg = float(p.get('margin_allocated', 0.0))
                 reg = p.get('regime', 'NONE')
                 conf = float(p.get('confidence', 0.0))
+                opened = p.get('opened_at', utc_now_iso())
 
                 if buf <= 0.0 and is_active and entry_p > t_stop:
                     buf = entry_p - t_stop
@@ -280,7 +360,8 @@ def load_state():
                     "units": unt,
                     "margin_allocated": marg,
                     "regime": reg,
-                    "confidence": conf
+                    "confidence": conf,
+                    "opened_at": opened
                 }
 
         print(f"♻️ Recovered State (last_updated={state.get('last_updated')})")
@@ -503,9 +584,12 @@ def discover_all_markets():
     universe = {}
 
     for ex_name, client in exchanges.items():
+        with state_lock:
+            manual_syms = list(manual_watchlist.get(ex_name, []))
+
         if TRADING_SYMBOLS_MODE.upper() != "AUTO":
             pairs = [s.strip() for s in TRADING_SYMBOLS_MODE.split(",") if s.strip()]
-            universe[ex_name] = pairs
+            universe[ex_name] = list(dict.fromkeys(pairs + manual_syms))
             continue
 
         try:
@@ -542,11 +626,12 @@ def discover_all_markets():
             if not top_pairs:
                 top_pairs = [f'BTC/{SCAN_QUOTE_CURRENCY}', f'ETH/{SCAN_QUOTE_CURRENCY}', f'SOL/{SCAN_QUOTE_CURRENCY}']
 
-            universe[ex_name] = top_pairs
+            universe[ex_name] = list(dict.fromkeys(top_pairs + manual_syms))
 
         except Exception as e:
             print(f"⚠️ Discovery warning for {ex_name.upper()}: {e}")
-            universe[ex_name] = [f'BTC/{SCAN_QUOTE_CURRENCY}', f'ETH/{SCAN_QUOTE_CURRENCY}']
+            fallback = [f'BTC/{SCAN_QUOTE_CURRENCY}', f'ETH/{SCAN_QUOTE_CURRENCY}']
+            universe[ex_name] = list(dict.fromkeys(fallback + manual_syms))
 
     with state_lock:
         active_candidate_universe = universe
@@ -710,7 +795,7 @@ def calculate_dynamic_entry(client, ex_name, symbol, current_price, atr, regime,
 # 12. ACTIVE POSITION GUARD ENGINE
 # =====================================================================
 def manage_active_position(key, current_price):
-    global positions, virtual_balance_usdt
+    global positions, virtual_balance_usdt, realized_pnl_total, realized_pnl_by_exchange
 
     with state_lock:
         pos = positions[key]
@@ -776,6 +861,8 @@ def manage_active_position(key, current_price):
 
             with state_lock:
                 positions[key]["position_active"] = False
+                realized_pnl_total += pnl
+                realized_pnl_by_exchange[ex_name] = realized_pnl_by_exchange.get(ex_name, 0.0) + pnl
             save_state()
 
         except Exception as e:
@@ -930,7 +1017,8 @@ def execution_orchestrator():
                     "units": plan['units'],
                     "margin_allocated": plan['margin_required'],
                     "regime": regime,
-                    "confidence": score
+                    "confidence": score,
+                    "opened_at": timestamp
                 }
             save_state()
 
@@ -1057,6 +1145,46 @@ def trading_engine_loop():
         print("ℹ️ Trading thread stopped. Web server remains active for diagnostics.")
 
 # =====================================================================
+# 14b. LIVE PRICE FEED DAEMON (fast-poll ticker refresh, independent of strategy loop)
+# =====================================================================
+def live_price_feed_loop():
+    update_engine_status(live_feed_alive=True)
+    print(f"📡 Live price feed thread starting (refresh every {LIVE_PRICE_REFRESH_SECONDS}s).")
+
+    while True:
+        try:
+            with state_lock:
+                watch_targets = {}
+                for key, p in positions.items():
+                    if p.get("position_active", False):
+                        watch_targets[key] = (p["exchange"], p["symbol"])
+                for item in top_scanned_opportunities:
+                    watch_targets[item["composite_key"]] = (item["exchange"], item["symbol"])
+
+            fresh_prices = {}
+            for key, (ex_name, symbol) in watch_targets.items():
+                client = exchanges.get(ex_name)
+                if not client:
+                    continue
+                try:
+                    ticker = client.fetch_ticker(symbol)
+                    price = ticker.get("last") or ticker.get("close") or 0.0
+                    fresh_prices[key] = {"price": float(price), "ts": utc_now_iso()}
+                except Exception as tick_err:
+                    print(f"⚠️ Live feed ticker fetch failed [{key}]: {tick_err}")
+
+            if fresh_prices:
+                with state_lock:
+                    live_prices.update(fresh_prices)
+
+            update_engine_status(live_feed_alive=True)
+
+        except Exception as e:
+            print(f"⚠️ Live price feed loop error: {e}")
+
+        time.sleep(max(2, LIVE_PRICE_REFRESH_SECONDS))
+
+# =====================================================================
 # 15. OPERATOR TERMINAL UI (MULTI-VENUE DASHBOARD)
 # =====================================================================
 app = Flask(__name__)
@@ -1097,6 +1225,8 @@ DASHBOARD_HTML = """
       display: flex;
       justify-content: space-between;
       align-items: center;
+      flex-wrap: wrap;
+      gap: 10px;
       padding: 14px 18px;
       background: var(--card);
       border: 1px solid var(--border);
@@ -1110,6 +1240,7 @@ DASHBOARD_HTML = """
       display: flex;
       align-items: center;
       gap: 10px;
+      flex-wrap: wrap;
     }
     .badge {
       display: inline-flex;
@@ -1136,6 +1267,28 @@ DASHBOARD_HTML = """
       animation: pulse 2s infinite ease-in-out;
     }
     @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+
+    .tabs {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 14px;
+      flex-wrap: wrap;
+    }
+    .tab-btn {
+      background: var(--card);
+      border: 1px solid var(--border);
+      color: var(--muted);
+      padding: 8px 16px;
+      border-radius: 8px;
+      font-family: var(--font-mono);
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      cursor: pointer;
+    }
+    .tab-btn.active { color: var(--text); border-color: var(--blue); background: rgba(88,166,255,0.1); }
+
     .grid {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
@@ -1167,6 +1320,7 @@ DASHBOARD_HTML = """
       color: var(--muted);
       margin-bottom: 10px;
       font-weight: 600;
+      margin-top: 6px;
     }
     .table-container {
       background: var(--card);
@@ -1203,6 +1357,115 @@ DASHBOARD_HTML = """
     }
     .venue-binance { background: rgba(240, 185, 11, 0.15); color: #f0b90b; border: 1px solid #f0b90b; }
     .venue-kraken { background: rgba(87, 65, 217, 0.15); color: #9c88ff; border: 1px solid #9c88ff; }
+    .pnl-pos { color: var(--green); font-weight: 700; }
+    .pnl-neg { color: var(--red); font-weight: 700; }
+    .live-dot {
+      display: inline-block;
+      width: 6px; height: 6px;
+      border-radius: 50%;
+      background: var(--green);
+      margin-right: 5px;
+      animation: pulse 1.4s infinite ease-in-out;
+    }
+
+    .live-trade-panel {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 16px;
+      margin-bottom: 16px;
+    }
+    .live-trade-empty { color: var(--muted); text-align: center; padding: 18px 0; }
+    .live-trade-card {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+      gap: 10px;
+      background: #0c1220;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 14px;
+      margin-bottom: 10px;
+    }
+    .live-trade-card:last-child { margin-bottom: 0; }
+    .ltc-field-label { font-size: 10px; color: var(--muted); text-transform: uppercase; margin-bottom: 3px; }
+    .ltc-field-value { font-size: 15px; font-weight: 700; }
+
+    .param-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      gap: 10px;
+    }
+    .param-item {
+      background: #0c1220;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 12px;
+    }
+    .param-label { font-size: 10px; color: var(--muted); text-transform: uppercase; margin-bottom: 4px; }
+    .param-value { font-size: 14px; font-weight: 700; color: var(--blue); }
+
+    .manual-panel {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 14px;
+    }
+    @media (max-width: 700px) { .manual-panel { grid-template-columns: 1fr; } }
+    .manual-col {
+      background: #0c1220;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 12px;
+    }
+    .manual-col h4 {
+      font-size: 12px; text-transform: uppercase; color: var(--muted); margin-bottom: 10px; letter-spacing: 0.5px;
+    }
+    .manual-form { display: flex; gap: 6px; margin-bottom: 10px; flex-wrap: wrap; }
+    .manual-form input, .manual-form select {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 7px 9px;
+      border-radius: 6px;
+      font-family: var(--font-mono);
+      font-size: 12px;
+      flex: 1;
+      min-width: 100px;
+    }
+    .manual-form button {
+      background: var(--blue);
+      color: #05080f;
+      border: none;
+      padding: 7px 14px;
+      border-radius: 6px;
+      font-family: var(--font-mono);
+      font-weight: 700;
+      font-size: 12px;
+      cursor: pointer;
+    }
+    .watchlist-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      background: #1a2233;
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 4px 8px;
+      border-radius: 999px;
+      font-size: 11px;
+    }
+    .chip button {
+      background: none;
+      border: none;
+      color: var(--red);
+      cursor: pointer;
+      font-weight: 700;
+      font-size: 12px;
+      line-height: 1;
+      padding: 0;
+    }
+    .manual-status { font-size: 11px; color: var(--muted); margin-top: 6px; min-height: 14px; }
+
     .raw-box {
       background: #05080f;
       border: 1px solid var(--border);
@@ -1231,8 +1494,15 @@ DASHBOARD_HTML = """
       <span class="badge badge-venue">BINANCE + KRAKEN</span>
       <span id="badge-mode" class="badge badge-testnet"><span class="dot"></span>MODE</span>
       <span id="badge-state" class="badge badge-running"><span class="dot"></span>RUNNING</span>
+      <span id="badge-feed" class="badge badge-testnet"><span class="live-dot"></span>LIVE FEED</span>
     </div>
     <div style="font-size: 12px; color: var(--muted);" id="last-updated">--:--:--</div>
+  </div>
+
+  <div class="tabs">
+    <button class="tab-btn active" data-venue="all" onclick="setVenueFilter('all')">All Venues</button>
+    <button class="tab-btn" data-venue="binance" onclick="setVenueFilter('binance')">Binance</button>
+    <button class="tab-btn" data-venue="kraken" onclick="setVenueFilter('kraken')">Kraken</button>
   </div>
 
   <div class="grid">
@@ -1252,6 +1522,19 @@ DASHBOARD_HTML = """
       <div class="card-label">News Safety Shield</div>
       <div class="card-value" id="val-news" style="font-size: 14px; margin-top: 4px;">MONITORING</div>
     </div>
+    <div class="card">
+      <div class="card-label">Unrealized PnL (open)</div>
+      <div class="card-value" id="val-unrealized">$0.00</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Realized PnL (closed)</div>
+      <div class="card-value" id="val-realized">$0.00</div>
+    </div>
+  </div>
+
+  <div class="section-title">🔴 Current Live Trade(s)</div>
+  <div class="live-trade-panel" id="live-trade-panel">
+    <div class="live-trade-empty">No open positions right now. The spotlight panel will populate the instant a trade fires.</div>
   </div>
 
   <div class="section-title">Active Positions Across Venues</div>
@@ -1266,12 +1549,14 @@ DASHBOARD_HTML = """
           <th>Size</th>
           <th>Margin</th>
           <th>Entry</th>
+          <th>Live Price</th>
+          <th>Unrealized PnL</th>
           <th>Trailing SL</th>
           <th>Target TP</th>
         </tr>
       </thead>
       <tbody id="active-positions-tbody">
-        <tr><td colspan="9" style="color: var(--muted); text-align: center;">No open positions. Dual scanner evaluating candidate markets.</td></tr>
+        <tr><td colspan="11" style="color: var(--muted); text-align: center;">No open positions. Dual scanner evaluating candidate markets.</td></tr>
       </tbody>
     </table>
   </div>
@@ -1285,15 +1570,47 @@ DASHBOARD_HTML = """
           <th>Market</th>
           <th>Regime</th>
           <th>Opportunity Score</th>
-          <th>Last Price</th>
+          <th>Last Scanned Price</th>
+          <th>Live Price</th>
           <th>ADX (14)</th>
           <th>RSI (14)</th>
         </tr>
       </thead>
       <tbody id="opportunities-tbody">
-        <tr><td colspan="7" style="color: var(--muted); text-align: center;">Scanning candidate markets across Binance & Kraken...</td></tr>
+        <tr><td colspan="8" style="color: var(--muted); text-align: center;">Scanning candidate markets across Binance & Kraken...</td></tr>
       </tbody>
     </table>
+  </div>
+
+  <div class="section-title">Manual Market Selection</div>
+  <div class="table-container" style="padding: 14px;">
+    <div class="manual-panel">
+      <div class="manual-col">
+        <h4>Binance Watchlist</h4>
+        <div class="manual-form">
+          <input type="text" id="binance-symbol-input" placeholder="e.g. BTC/USDT" />
+          <button onclick="addManualSymbol('binance')">Add</button>
+        </div>
+        <div class="watchlist-chips" id="binance-watchlist-chips"></div>
+        <div class="manual-status" id="binance-manual-status"></div>
+      </div>
+      <div class="manual-col">
+        <h4>Kraken Watchlist</h4>
+        <div class="manual-form">
+          <input type="text" id="kraken-symbol-input" placeholder="e.g. ETH/USDT" />
+          <button onclick="addManualSymbol('kraken')">Add</button>
+        </div>
+        <div class="watchlist-chips" id="kraken-watchlist-chips"></div>
+        <div class="manual-status" id="kraken-manual-status"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="section-title">Bot Entry Parameters</div>
+  <div class="table-container" style="padding: 14px;">
+    <div class="param-grid" id="param-grid">
+      <div class="param-item"><div class="param-label">Loading...</div><div class="param-value">--</div></div>
+    </div>
   </div>
 
   <div class="section-title">Raw Engine Telemetry Diagnostics</div>
@@ -1301,86 +1618,266 @@ DASHBOARD_HTML = """
 
   <div class="footer">
     <span>Endpoint: /status</span>
-    <span>Auto-refresh: 3s</span>
+    <span>Auto-refresh: 3s &middot; Live feed: fast poll</span>
   </div>
 
   <script>
+    let venueFilter = 'all';
+    let lastSnapshot = null;
+
+    function setVenueFilter(v) {
+      venueFilter = v;
+      document.querySelectorAll('.tab-btn').forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.venue === v);
+      });
+      if (lastSnapshot) renderDashboard(lastSnapshot);
+    }
+
+    function fmtMoney(n) {
+      const v = Number(n || 0);
+      return (v >= 0 ? '$' : '-$') + Math.abs(v).toFixed(2);
+    }
+
+    function pnlClass(n) {
+      return Number(n) >= 0 ? 'pnl-pos' : 'pnl-neg';
+    }
+
+    function venueClass(ex) {
+      return ex === 'binance' ? 'venue-binance' : 'venue-kraken';
+    }
+
+    function matchesFilter(ex) {
+      return venueFilter === 'all' || ex === venueFilter;
+    }
+
+    async function addManualSymbol(exchange) {
+      const inputEl = document.getElementById(exchange + '-symbol-input');
+      const statusEl = document.getElementById(exchange + '-manual-status');
+      const symbol = (inputEl.value || '').trim().toUpperCase();
+      if (!symbol.includes('/')) {
+        statusEl.textContent = 'Enter symbol as BASE/QUOTE, e.g. BTC/USDT';
+        return;
+      }
+      statusEl.textContent = 'Adding ' + symbol + '...';
+      try {
+        const res = await fetch('/manual-market', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ exchange: exchange, symbol: symbol, action: 'add' })
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          statusEl.textContent = data.error || 'Failed to add symbol.';
+          return;
+        }
+        inputEl.value = '';
+        statusEl.textContent = symbol + ' added to ' + exchange + ' watchlist.';
+        renderWatchlist(exchange, data[exchange] || []);
+      } catch (err) {
+        statusEl.textContent = 'Request failed: ' + err;
+      }
+    }
+
+    async function removeManualSymbol(exchange, symbol) {
+      try {
+        const res = await fetch('/manual-market', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ exchange: exchange, symbol: symbol, action: 'remove' })
+        });
+        const data = await res.json();
+        if (res.ok) renderWatchlist(exchange, data[exchange] || []);
+      } catch (err) {
+        console.error(err);
+      }
+    }
+
+    function renderWatchlist(exchange, symbols) {
+      const container = document.getElementById(exchange + '-watchlist-chips');
+      if (!container) return;
+      container.innerHTML = '';
+      if (!symbols.length) {
+        container.innerHTML = '<span style="color: var(--muted); font-size: 11px;">No manual symbols added yet.</span>';
+        return;
+      }
+      for (const sym of symbols) {
+        const chip = document.createElement('span');
+        chip.className = 'chip';
+        chip.innerHTML = '<span>' + sym + '</span>';
+        const btn = document.createElement('button');
+        btn.textContent = '×';
+        btn.onclick = () => removeManualSymbol(exchange, sym);
+        chip.appendChild(btn);
+        container.appendChild(chip);
+      }
+    }
+
+    function renderParams(params) {
+      const grid = document.getElementById('param-grid');
+      if (!params) return;
+      const entries = [
+        ['Risk / Trade', (params.risk_pct_per_trade * 100).toFixed(2) + '%'],
+        ['Reward:Risk', '1 : ' + params.rr_ratio],
+        ['Leverage Range', params.min_leverage + 'x – ' + params.max_leverage + 'x'],
+        ['Max Concurrent Positions', params.max_concurrent_positions],
+        ['Max Portfolio Margin', (params.max_portfolio_margin_pct * 100).toFixed(0) + '%'],
+        ['ADX Trend Threshold', params.adx_trend_threshold],
+        ['ATR Multiplier', params.atr_multiplier],
+        ['Timeframe', params.timeframe],
+        ['Scan Quote Currency', params.scan_quote_currency],
+        ['Top Liquid Pairs Scanned', params.scan_top_liquid_pairs],
+        ['Strategy Loop Interval', params.loop_interval_seconds + 's'],
+        ['Live Feed Refresh', params.live_price_refresh_seconds + 's'],
+        ['Symbol Mode', params.trading_symbols_mode]
+      ];
+      grid.innerHTML = '';
+      for (const [label, value] of entries) {
+        const item = document.createElement('div');
+        item.className = 'param-item';
+        item.innerHTML = '<div class="param-label">' + label + '</div><div class="param-value">' + value + '</div>';
+        grid.appendChild(item);
+      }
+    }
+
+    function renderLiveTradePanel(positions) {
+      const panel = document.getElementById('live-trade-panel');
+      const entries = Object.entries(positions).filter(([k, p]) => matchesFilter(p.exchange));
+      if (entries.length === 0) {
+        panel.innerHTML = '<div class="live-trade-empty">No open positions right now. The spotlight panel will populate the instant a trade fires.</div>';
+        return;
+      }
+      panel.innerHTML = '';
+      for (const [key, pos] of entries) {
+        const card = document.createElement('div');
+        card.className = 'live-trade-card';
+        const pnlCls = pnlClass(pos.unrealized_pnl);
+        let heldFor = '--';
+        if (pos.opened_at) {
+          const openedMs = new Date(pos.opened_at).getTime();
+          if (!isNaN(openedMs)) {
+            const diffMin = Math.floor((Date.now() - openedMs) / 60000);
+            heldFor = diffMin < 60 ? (diffMin + 'm') : (Math.floor(diffMin / 60) + 'h ' + (diffMin % 60) + 'm');
+          }
+        }
+        card.innerHTML = `
+          <div><div class="ltc-field-label">Venue / Symbol</div><div class="ltc-field-value"><span class="venue-tag ${venueClass(pos.exchange)}">${pos.exchange}</span> ${pos.symbol}</div></div>
+          <div><div class="ltc-field-label">Regime</div><div class="ltc-field-value">${pos.regime}</div></div>
+          <div><div class="ltc-field-label">Entry Price</div><div class="ltc-field-value">$${Number(pos.entry_price).toFixed(2)}</div></div>
+          <div><div class="ltc-field-label"><span class="live-dot"></span>Live Price</div><div class="ltc-field-value">$${Number(pos.current_price).toFixed(2)}</div></div>
+          <div><div class="ltc-field-label">Unrealized PnL</div><div class="ltc-field-value ${pnlCls}">${fmtMoney(pos.unrealized_pnl)} (${Number(pos.unrealized_pnl_pct).toFixed(2)}%)</div></div>
+          <div><div class="ltc-field-label">Leverage</div><div class="ltc-field-value">${pos.leverage}x</div></div>
+          <div><div class="ltc-field-label">Trailing SL / TP</div><div class="ltc-field-value">$${Number(pos.trailing_stop).toFixed(2)} / $${Number(pos.take_profit).toFixed(2)}</div></div>
+          <div><div class="ltc-field-label">Held For</div><div class="ltc-field-value">${heldFor}</div></div>
+        `;
+        panel.appendChild(card);
+      }
+    }
+
+    function renderDashboard(data) {
+      const badgeMode = document.getElementById('badge-mode');
+      if (data.mode === 'PAPER_TRADING') {
+        badgeMode.textContent = 'PAPER SIMULATION';
+        badgeMode.className = 'badge badge-paper';
+        document.getElementById('val-mode').textContent = 'PAPER SIMULATION';
+      } else {
+        badgeMode.textContent = 'BINANCE TESTNET / KRAKEN';
+        badgeMode.className = 'badge badge-testnet';
+        document.getElementById('val-mode').textContent = 'DEMO TESTNET & LIVE';
+      }
+
+      const badgeState = document.getElementById('badge-state');
+      badgeState.textContent = data.engine_state;
+      badgeState.className = 'badge ' + (data.engine_state === 'RUNNING' ? 'badge-running' : 'badge-halted');
+
+      const badgeFeed = document.getElementById('badge-feed');
+      badgeFeed.textContent = data.live_feed_alive ? 'LIVE FEED ACTIVE' : 'LIVE FEED IDLE';
+      badgeFeed.className = 'badge ' + (data.live_feed_alive ? 'badge-running' : 'badge-halted');
+
+      document.getElementById('last-updated').textContent = new Date().toLocaleTimeString();
+      document.getElementById('val-scanner').textContent = data.scanner_status || 'SCANNING';
+
+      const allPositions = data.positions || {};
+      const filteredPositionsCount = Object.values(allPositions).filter(p => matchesFilter(p.exchange)).length;
+      document.getElementById('val-positions').textContent = filteredPositionsCount + ' / ' + (data.bot_parameters ? data.bot_parameters.max_concurrent_positions : 3) + ' Cap';
+      document.getElementById('val-news').textContent = data.active_news_status || 'MONITORING';
+      document.getElementById('val-unrealized').textContent = fmtMoney(data.total_unrealized_pnl);
+      document.getElementById('val-unrealized').className = 'card-value ' + pnlClass(data.total_unrealized_pnl);
+
+      const realizedForFilter = venueFilter === 'all'
+        ? data.realized_pnl_total
+        : (data.realized_pnl_by_exchange ? data.realized_pnl_by_exchange[venueFilter] : 0) || 0;
+      document.getElementById('val-realized').textContent = fmtMoney(realizedForFilter);
+      document.getElementById('val-realized').className = 'card-value ' + pnlClass(realizedForFilter);
+
+      renderLiveTradePanel(allPositions);
+
+      // 1. Active Positions Table
+      const actBody = document.getElementById('active-positions-tbody');
+      actBody.innerHTML = '';
+      const posEntries = Object.entries(allPositions).filter(([k, p]) => matchesFilter(p.exchange));
+      if (posEntries.length === 0) {
+        actBody.innerHTML = '<tr><td colspan="11" style="color: var(--muted); text-align: center;">No open positions for this venue filter.</td></tr>';
+      } else {
+        for (const [key, pos] of posEntries) {
+          const exClass = venueClass(pos.exchange);
+          const row = document.createElement('tr');
+          row.innerHTML = `
+            <td><span class="venue-tag ${exClass}">${pos.exchange}</span></td>
+            <td><strong>${pos.symbol}</strong></td>
+            <td>${pos.regime}</td>
+            <td>${pos.leverage}x</td>
+            <td>${pos.units}</td>
+            <td>$${Number(pos.margin_allocated).toFixed(2)}</td>
+            <td>$${Number(pos.entry_price).toFixed(2)}</td>
+            <td>$${Number(pos.current_price).toFixed(2)}</td>
+            <td class="${pnlClass(pos.unrealized_pnl)}">${fmtMoney(pos.unrealized_pnl)}</td>
+            <td>$${Number(pos.trailing_stop).toFixed(2)}</td>
+            <td>$${Number(pos.take_profit).toFixed(2)}</td>
+          `;
+          actBody.appendChild(row);
+        }
+      }
+
+      // 2. Top Scanned Opportunities Table
+      const oppBody = document.getElementById('opportunities-tbody');
+      oppBody.innerHTML = '';
+      const opps = (data.top_opportunities || []).filter(item => matchesFilter(item.exchange));
+      if (opps.length === 0) {
+        oppBody.innerHTML = '<tr><td colspan="8" style="color: var(--muted); text-align: center;">Evaluating candidate markets across venues...</td></tr>';
+      } else {
+        for (const item of opps) {
+          const exClass = venueClass(item.exchange);
+          const row = document.createElement('tr');
+          const livePrice = (item.live_price !== undefined) ? '$' + Number(item.live_price).toFixed(2) : '--';
+          row.innerHTML = `
+            <td><span class="venue-tag ${exClass}">${item.exchange}</span></td>
+            <td><strong>${item.symbol}</strong></td>
+            <td>${item.regime}</td>
+            <td class="score-high">${Number(item.score).toFixed(3)}</td>
+            <td>$${Number(item.price).toFixed(2)}</td>
+            <td>${livePrice}</td>
+            <td>${Number(item.adx).toFixed(1)}</td>
+            <td>${Number(item.rsi).toFixed(1)}</td>
+          `;
+          oppBody.appendChild(row);
+        }
+      }
+
+      renderParams(data.bot_parameters);
+
+      const manualWatchlist = data.manual_watchlist || {};
+      renderWatchlist('binance', manualWatchlist.binance || []);
+      renderWatchlist('kraken', manualWatchlist.kraken || []);
+
+      document.getElementById('raw-state').textContent = JSON.stringify(data, null, 2);
+    }
+
     async function updateDashboard() {
       try {
         const res = await fetch('/status');
         const data = await res.json();
-
-        const badgeMode = document.getElementById('badge-mode');
-        if (data.mode === 'PAPER_TRADING') {
-          badgeMode.textContent = 'PAPER SIMULATION';
-          badgeMode.className = 'badge badge-paper';
-          document.getElementById('val-mode').textContent = 'PAPER SIMULATION';
-        } else {
-          badgeMode.textContent = 'BINANCE TESTNET / KRAKEN';
-          badgeMode.className = 'badge badge-testnet';
-          document.getElementById('val-mode').textContent = 'DEMO TESTNET & LIVE';
-        }
-
-        const badgeState = document.getElementById('badge-state');
-        badgeState.textContent = data.engine_state;
-        badgeState.className = 'badge ' + (data.engine_state === 'RUNNING' ? 'badge-running' : 'badge-halted');
-
-        document.getElementById('last-updated').textContent = new Date().toLocaleTimeString();
-        document.getElementById('val-scanner').textContent = data.scanner_status || 'SCANNING';
-        document.getElementById('val-positions').textContent = Object.keys(data.positions || {}).length + ' / 3 Cap';
-        document.getElementById('val-news').textContent = data.active_news_status || 'MONITORING';
-
-        // 1. Active Positions Table
-        const actBody = document.getElementById('active-positions-tbody');
-        actBody.innerHTML = '';
-        const posEntries = Object.entries(data.positions || {});
-        if (posEntries.length === 0) {
-          actBody.innerHTML = '<tr><td colspan="9" style="color: var(--muted); text-align: center;">No open positions. Dual scanner seeking setups.</td></tr>';
-        } else {
-          for (const [key, pos] of posEntries) {
-            const exName = pos.exchange || 'binance';
-            const exClass = exName === 'binance' ? 'venue-binance' : 'venue-kraken';
-            const row = document.createElement('tr');
-            row.innerHTML = `
-              <td><span class="venue-tag ${exClass}">${exName}</span></td>
-              <td><strong>${pos.symbol}</strong></td>
-              <td>${pos.regime}</td>
-              <td>${pos.leverage}x</td>
-              <td>${pos.units}</td>
-              <td>$${Number(pos.margin_allocated).toFixed(2)}</td>
-              <td>$${Number(pos.entry_price).toFixed(2)}</td>
-              <td>$${Number(pos.trailing_stop).toFixed(2)}</td>
-              <td>$${Number(pos.take_profit).toFixed(2)}</td>
-            `;
-            actBody.appendChild(row);
-          }
-        }
-
-        // 2. Top Scanned Opportunities Table
-        const oppBody = document.getElementById('opportunities-tbody');
-        oppBody.innerHTML = '';
-        const opps = data.top_opportunities || [];
-        if (opps.length === 0) {
-          oppBody.innerHTML = '<tr><td colspan="7" style="color: var(--muted); text-align: center;">Evaluating candidate markets across venues...</td></tr>';
-        } else {
-          for (const item of opps) {
-            const exName = item.exchange || 'binance';
-            const exClass = exName === 'binance' ? 'venue-binance' : 'venue-kraken';
-            const row = document.createElement('tr');
-            row.innerHTML = `
-              <td><span class="venue-tag ${exClass}">${exName}</span></td>
-              <td><strong>${item.symbol}</strong></td>
-              <td>${item.regime}</td>
-              <td class="score-high">${Number(item.score).toFixed(3)}</td>
-              <td>$${Number(item.price).toFixed(2)}</td>
-              <td>${Number(item.adx).toFixed(1)}</td>
-              <td>${Number(item.rsi).toFixed(1)}</td>
-            `;
-            oppBody.appendChild(row);
-          }
-        }
-
-        document.getElementById('raw-state').textContent = JSON.stringify(data, null, 2);
+        lastSnapshot = data;
+        renderDashboard(data);
       } catch (err) {
         document.getElementById('badge-state').textContent = 'DISCONNECTED';
         document.getElementById('badge-state').className = 'badge badge-halted';
@@ -1412,6 +1909,74 @@ def health():
 def status():
     return jsonify(get_status_snapshot()), 200
 
+@app.route("/config", methods=["GET"])
+def config():
+    return jsonify({
+        "risk_pct_per_trade": RISK_PCT_PER_TRADE,
+        "rr_ratio": RR_RATIO,
+        "min_leverage": MIN_LEVERAGE,
+        "max_leverage": MAX_LEVERAGE,
+        "max_concurrent_positions": MAX_CONCURRENT_POSITIONS,
+        "max_portfolio_margin_pct": MAX_PORTFOLIO_MARGIN_PCT,
+        "adx_trend_threshold": ADX_TREND_THRESHOLD,
+        "atr_multiplier": ATR_MULTIPLIER,
+        "timeframe": TIMEFRAME,
+        "scan_quote_currency": SCAN_QUOTE_CURRENCY,
+        "scan_top_liquid_pairs": SCAN_TOP_LIQUID_PAIRS,
+        "loop_interval_seconds": LOOP_INTERVAL_SECONDS,
+        "live_price_refresh_seconds": LIVE_PRICE_REFRESH_SECONDS,
+        "trading_symbols_mode": TRADING_SYMBOLS_MODE,
+        "paper_trading": PAPER_TRADING,
+        "paper_initial_balance": PAPER_INITIAL_BALANCE if PAPER_TRADING else None
+    }), 200
+
+@app.route("/symbols/<exchange>", methods=["GET"])
+def list_symbols(exchange):
+    ex_name = exchange.strip().lower()
+    if ex_name not in exchanges:
+        return jsonify({"error": f"Exchange '{exchange}' is not enabled on this instance."}), 404
+    client = exchanges[ex_name]
+    try:
+        if not client.markets:
+            client.load_markets()
+        symbols = sorted([s for s in client.markets.keys() if s.endswith(f"/{SCAN_QUOTE_CURRENCY}")])
+        return jsonify({"exchange": ex_name, "quote": SCAN_QUOTE_CURRENCY, "symbols": symbols}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/manual-market", methods=["GET", "POST"])
+def manual_market():
+    global manual_watchlist
+
+    if request.method == "GET":
+        with state_lock:
+            return jsonify({k: list(v) for k, v in manual_watchlist.items()}), 200
+
+    payload = request.get_json(force=True, silent=True) or {}
+    ex_name = str(payload.get("exchange", "")).strip().lower()
+    symbol = str(payload.get("symbol", "")).strip().upper()
+    action = str(payload.get("action", "add")).strip().lower()
+
+    if ex_name not in exchanges:
+        return jsonify({"error": f"Exchange '{ex_name}' is not enabled on this instance."}), 400
+    if "/" not in symbol:
+        return jsonify({"error": "Symbol must be in BASE/QUOTE format, e.g. BTC/USDT"}), 400
+    if action not in ("add", "remove"):
+        return jsonify({"error": "action must be 'add' or 'remove'"}), 400
+
+    with state_lock:
+        watchlist = manual_watchlist.setdefault(ex_name, [])
+        if action == "add":
+            if symbol not in watchlist:
+                watchlist.append(symbol)
+        else:
+            if symbol in watchlist:
+                watchlist.remove(symbol)
+        snapshot = {k: list(v) for k, v in manual_watchlist.items()}
+
+    save_state()
+    return jsonify(snapshot), 200
+
 # =====================================================================
 # 16. APPLICATION BOOTSTRAP
 # =====================================================================
@@ -1432,14 +1997,34 @@ def start_trading_thread():
     engine_thread.start()
     print("🧵 Dual-Exchange Quantum Engine thread started.")
 
+def start_live_feed_thread():
+    active_threads = [
+        t for t in threading.enumerate()
+        if t.name == "LivePriceFeed" and t.is_alive()
+    ]
+    if active_threads:
+        print("⚠️ Live price feed thread already running. Skipping duplicate spawn.")
+        return
+
+    feed_thread = threading.Thread(
+        target=live_price_feed_loop,
+        name="LivePriceFeed",
+        daemon=True
+    )
+    feed_thread.start()
+    print("🧵 Live price feed thread started.")
+
 if __name__ == "__main__":
     print(f"🌐 Starting Dual-Exchange Web Service on 0.0.0.0:{SERVER_PORT}")
     print(f"🏛️ Enabled Venues: {list(exchanges.keys())}")
     print("💻 Dashboard: /")
     print("📡 Health Check: /health")
     print("📊 Telemetry API: /status")
+    print("⚙️  Config API: /config")
+    print("🎯 Manual Market API: /manual-market")
 
     start_trading_thread()
+    start_live_feed_thread()
 
     app.run(
         host="0.0.0.0",

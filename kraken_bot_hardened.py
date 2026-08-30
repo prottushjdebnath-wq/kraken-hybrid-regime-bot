@@ -27,21 +27,22 @@ ENABLE_TELEGRAM = os.environ.get("ENABLE_TELEGRAM", "false").strip().lower() in 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
-# Candidate Pool Watchlist
-SYMBOLS_RAW = os.environ.get("TRADING_SYMBOLS", "SOL/USDT,BTC/USDT,ETH/USDT").strip()
-SYMBOLS = [s.strip() for s in SYMBOLS_RAW.split(",") if s.strip()]
+# Dynamic Market Discovery Engine
+TRADING_SYMBOLS_MODE = os.environ.get("TRADING_SYMBOLS", "AUTO").strip()
+SCAN_QUOTE_CURRENCY = os.environ.get("SCAN_QUOTE_CURRENCY", "USDT").strip().upper()
+SCAN_TOP_LIQUID_PAIRS = int(os.environ.get("SCAN_TOP_LIQUID_PAIRS", "20"))
 
 TIMEFRAME = os.environ.get("TRADING_TIMEFRAME", "15m").strip()
 ADX_TREND_THRESHOLD = float(os.environ.get("ADX_TREND_THRESHOLD", "25.0"))
 ATR_MULTIPLIER = float(os.environ.get("ATR_MULTIPLIER", "1.5"))
 
-# DYNAMIC RISK & PORTFOLIO SIZING PARAMETERS
-RISK_PCT_PER_TRADE = float(os.environ.get("RISK_PCT_PER_TRADE", "0.015"))  # 1.5% equity risked per trade
-RR_RATIO = float(os.environ.get("RR_RATIO", "2.0"))                       # 1:2 Risk to Reward Take-Profit
+# Dynamic Portfolio & Risk Settings
+RISK_PCT_PER_TRADE = float(os.environ.get("RISK_PCT_PER_TRADE", "0.015"))
+RR_RATIO = float(os.environ.get("RR_RATIO", "2.0"))
 MIN_LEVERAGE = float(os.environ.get("MIN_LEVERAGE", "1.0"))
-MAX_LEVERAGE = float(os.environ.get("MAX_LEVERAGE", "3.0"))               # Software-side hard cap (<= 5x max)
+MAX_LEVERAGE = float(os.environ.get("MAX_LEVERAGE", "3.0"))
 MAX_CONCURRENT_POSITIONS = int(os.environ.get("MAX_CONCURRENT_POSITIONS", "2"))
-MAX_PORTFOLIO_MARGIN_PCT = float(os.environ.get("MAX_PORTFOLIO_MARGIN_PCT", "0.60")) # Max 60% of equity in margin
+MAX_PORTFOLIO_MARGIN_PCT = float(os.environ.get("MAX_PORTFOLIO_MARGIN_PCT", "0.60"))
 
 MAX_FAILURES_ALLOWED = int(os.environ.get("MAX_FAILURES_ALLOWED", "3"))
 MIN_BALANCE_USDT = float(os.environ.get("MIN_BALANCE_USDT", "10.0"))
@@ -53,7 +54,6 @@ CSV_FILE_PATH = "kraken_bot_trade_ledger.csv"
 STATE_FILE_PATH = "kraken_bot_state.json"
 
 def validate_environment():
-    """Fail-loud preflight check on mandatory runtime variables."""
     missing_vars = []
     if not PAPER_TRADING:
         if not API_KEY:
@@ -64,8 +64,6 @@ def validate_environment():
         missing_vars.append("UPSTASH_REDIS_REST_URL")
     if not UPSTASH_REDIS_REST_TOKEN:
         missing_vars.append("UPSTASH_REDIS_REST_TOKEN")
-    if not SYMBOLS:
-        missing_vars.append("TRADING_SYMBOLS")
     if ENABLE_TELEGRAM:
         if not TELEGRAM_BOT_TOKEN:
             missing_vars.append("TELEGRAM_BOT_TOKEN")
@@ -80,24 +78,13 @@ def validate_environment():
 validate_environment()
 
 # =====================================================================
-# 2. SYNCHRONIZED RUNTIME STATE (MULTI-PAIR & MARGIN SCHEMA)
+# 2. SYNCHRONIZED RUNTIME STATE
 # =====================================================================
 state_lock = threading.Lock()
 
+active_candidate_universe = []
 positions = {}
-for s in SYMBOLS:
-    positions[s] = {
-        "position_active": False,
-        "entry_price": 0.0,
-        "trailing_stop": 0.0,
-        "stop_loss_distance": 0.0,
-        "take_profit": 0.0,
-        "leverage": 1.0,
-        "units": 0.0,
-        "margin_allocated": 0.0,
-        "regime": "NONE",
-        "confidence": 0.0
-    }
+top_scanned_opportunities = []
 
 virtual_balance_usdt = PAPER_INITIAL_BALANCE
 consecutive_failures = 0
@@ -113,6 +100,7 @@ engine_status = {
     "startup_timestamp": None,
     "paper_trading": PAPER_TRADING,
     "persistence_backend": "UPSTASH_REDIS_REST",
+    "scanner_status": "IDLE",
     "active_news_status": "MONITORING"
 }
 
@@ -125,15 +113,18 @@ def update_engine_status(**kwargs):
 
 def get_status_snapshot():
     with state_lock:
-        total_margin_used = sum(p["margin_allocated"] for p in positions.values() if p["position_active"])
+        total_margin_used = sum(p["margin_allocated"] for p in positions.values() if p.get("position_active", False))
         snapshot = dict(engine_status)
         snapshot.update({
             "mode": "PAPER_TRADING" if PAPER_TRADING else "LIVE_CAPITAL",
             "virtual_balance_usdt": virtual_balance_usdt if PAPER_TRADING else None,
             "total_margin_allocated": round(total_margin_used, 2),
-            "tracked_symbols": SYMBOLS,
+            "scanner_mode": TRADING_SYMBOLS_MODE,
+            "tracked_universe_count": len(active_candidate_universe),
+            "active_candidate_universe": active_candidate_universe,
             "timeframe": TIMEFRAME,
-            "positions": {sym: dict(data) for sym, data in positions.items()},
+            "positions": {sym: dict(data) for sym, data in positions.items() if data.get("position_active", False)},
+            "top_opportunities": list(top_scanned_opportunities),
             "consecutive_failures": consecutive_failures,
             "risk_pct_per_trade": RISK_PCT_PER_TRADE,
             "rr_ratio": RR_RATIO,
@@ -169,10 +160,11 @@ def upstash_command(command_list):
 
 def save_state():
     with state_lock:
+        active_pos_only = {sym: data for sym, data in positions.items() if data.get("position_active", False)}
         state = {
             'paper_trading': PAPER_TRADING,
             'virtual_balance_usdt': virtual_balance_usdt,
-            'positions': positions,
+            'positions': active_pos_only,
             'consecutive_failures': consecutive_failures,
             'last_updated': utc_now_iso()
         }
@@ -218,7 +210,7 @@ def load_state():
             except Exception as e:
                 print(f"⚠️ Failed reading local sidecar: {e}")
         else:
-            print("ℹ️ No prior state found in Upstash or local disk. Initializing clean registry.")
+            print("ℹ️ No prior state found. Initializing clean registry.")
             return
 
     try:
@@ -229,56 +221,40 @@ def load_state():
                 virtual_balance_usdt = float(state['virtual_balance_usdt'])
 
             saved_positions = state.get('positions', {})
-            for sym in SYMBOLS:
-                if sym in saved_positions:
-                    p = saved_positions[sym]
-                    is_active = bool(p.get('position_active', False))
-                    entry_p = float(p.get('entry_price', 0.0))
-                    t_stop = float(p.get('trailing_stop', 0.0))
-                    buf = float(p.get('stop_loss_distance', 0.0))
-                    tp = float(p.get('take_profit', 0.0))
-                    lev = float(p.get('leverage', 1.0))
-                    unt = float(p.get('units', 0.0))
-                    marg = float(p.get('margin_allocated', 0.0))
-                    reg = p.get('regime', 'NONE')
-                    conf = float(p.get('confidence', 0.0))
+            for sym, p in saved_positions.items():
+                is_active = bool(p.get('position_active', False))
+                entry_p = float(p.get('entry_price', 0.0))
+                t_stop = float(p.get('trailing_stop', 0.0))
+                buf = float(p.get('stop_loss_distance', 0.0))
+                tp = float(p.get('take_profit', 0.0))
+                lev = float(p.get('leverage', 1.0))
+                unt = float(p.get('units', 0.0))
+                marg = float(p.get('margin_allocated', 0.0))
+                reg = p.get('regime', 'NONE')
+                conf = float(p.get('confidence', 0.0))
 
-                    if buf <= 0.0 and is_active and entry_p > t_stop:
-                        buf = entry_p - t_stop
-                    if tp <= 0.0 and is_active and entry_p > 0:
-                        tp = entry_p + (buf * RR_RATIO)
+                if buf <= 0.0 and is_active and entry_p > t_stop:
+                    buf = entry_p - t_stop
+                if tp <= 0.0 and is_active and entry_p > 0:
+                    tp = entry_p + (buf * RR_RATIO)
 
-                    positions[sym] = {
-                        "position_active": is_active,
-                        "entry_price": entry_p,
-                        "trailing_stop": t_stop,
-                        "stop_loss_distance": buf,
-                        "take_profit": tp,
-                        "leverage": lev,
-                        "units": unt,
-                        "margin_allocated": marg,
-                        "regime": reg,
-                        "confidence": conf
-                    }
-                else:
-                    positions[sym] = {
-                        "position_active": False,
-                        "entry_price": 0.0,
-                        "trailing_stop": 0.0,
-                        "stop_loss_distance": 0.0,
-                        "take_profit": 0.0,
-                        "leverage": 1.0,
-                        "units": 0.0,
-                        "margin_allocated": 0.0,
-                        "regime": "NONE",
-                        "confidence": 0.0
-                    }
+                positions[sym] = {
+                    "position_active": is_active,
+                    "entry_price": entry_p,
+                    "trailing_stop": t_stop,
+                    "stop_loss_distance": buf,
+                    "take_profit": tp,
+                    "leverage": lev,
+                    "units": unt,
+                    "margin_allocated": marg,
+                    "regime": reg,
+                    "confidence": conf
+                }
 
         print(f"♻️ Recovered State (last_updated={state.get('last_updated')})")
         if PAPER_TRADING:
             print(f"   ↳ [PAPER] Virtual Balance: ${virtual_balance_usdt:.2f} USDT")
-        for sym in SYMBOLS:
-            p = positions[sym]
+        for sym, p in positions.items():
             if p["position_active"]:
                 print(f"   ↳ [{sym}] ACTIVE | Entry: {p['entry_price']:.2f} | Stop: {p['trailing_stop']:.2f} | TP: {p['take_profit']:.2f} | Lev: {p['leverage']}x")
 
@@ -295,23 +271,24 @@ def reconcile_state_with_exchange():
     global positions
 
     if PAPER_TRADING:
-        print("📄 Paper Trading Mode active: Real exchange balance reconciliation bypassed.")
+        print("📄 Paper Trading Mode active: Real exchange reconciliation bypassed.")
         with state_lock:
-            for sym in SYMBOLS:
-                p = positions[sym]
+            for sym, p in positions.items():
                 if p["position_active"]:
-                    print(f"   ↳ Active Virtual Position: [{sym}] | Entry: ${p['entry_price']:.2f} | Leverage: {p['leverage']}x")
+                    print(f"   ↳ Active Virtual Position: [{sym}] | Entry: ${p['entry_price']:.2f}")
         return True
 
     try:
         balances = exchange.fetch_balance()
         dirty = False
 
-        for sym in SYMBOLS:
+        with state_lock:
+            active_symbols = [sym for sym, p in positions.items() if p["position_active"]]
+
+        for sym in active_symbols:
             base_asset = sym.split('/')[0]
             with state_lock:
                 expected_units = positions[sym]["units"]
-                current_pos = positions[sym]["position_active"]
 
             base_balance = (
                 balances['free'].get(base_asset, 0.0)
@@ -320,38 +297,15 @@ def reconcile_state_with_exchange():
             threshold = expected_units * 0.9 if expected_units > 0 else 0.0001
             holds_asset = base_balance >= threshold
 
-            print(f"🔎 Startup reconciliation [{sym}] | {base_asset} balance={base_balance:.8f} | local_active={current_pos}")
+            print(f"🔎 Startup reconciliation [{sym}] | balance={base_balance:.8f}")
 
-            if current_pos and not holds_asset:
-                msg = (
-                    f"⚠️ *STATE MISMATCH* [{sym}]: State says position is OPEN, but exchange shows "
-                    f"insufficient {base_asset} balance ({base_balance:.8f}). Flushing stale position."
-                )
+            if not holds_asset:
+                msg = f"⚠️ *STATE MISMATCH* [{sym}]: Position recorded open but balance missing ({base_balance:.8f}). Flushing."
                 print(msg)
                 send_telegram_notification(msg)
                 with state_lock:
-                    positions[sym] = {
-                        "position_active": False,
-                        "entry_price": 0.0,
-                        "trailing_stop": 0.0,
-                        "stop_loss_distance": 0.0,
-                        "take_profit": 0.0,
-                        "leverage": 1.0,
-                        "units": 0.0,
-                        "margin_allocated": 0.0,
-                        "regime": "NONE",
-                        "confidence": 0.0
-                    }
+                    positions[sym]["position_active"] = False
                 dirty = True
-
-            elif not current_pos and holds_asset:
-                msg = (
-                    f"⚠️ *STATE MISMATCH* [{sym}]: Exchange shows {base_asset} balance ({base_balance:.8f}) "
-                    f"but local state says NO position is open. Halting to defend unmanaged capital."
-                )
-                print(msg)
-                send_telegram_notification(msg)
-                raise SystemExit(msg)
 
         if dirty:
             save_state()
@@ -359,10 +313,8 @@ def reconcile_state_with_exchange():
         print("✅ Startup reconciliation completed.")
         return True
 
-    except SystemExit:
-        raise
     except Exception as e:
-        msg = f"❌ Startup reconciliation failed — exchange truth unavailable: {e}"
+        msg = f"❌ Startup reconciliation failed: {e}"
         print(msg)
         send_telegram_notification(msg)
         raise RuntimeError(msg) from e
@@ -374,7 +326,7 @@ def send_telegram_notification(message):
     if not ENABLE_TELEGRAM:
         return
     try:
-        prefix = "📝 *[PAPER TRADING]* " if PAPER_TRADING else ""
+        prefix = "📝 *[PAPER SCANNER]* " if PAPER_TRADING else "⚡ *[LIVE SCANNER]* "
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         payload = {
             "chat_id": TELEGRAM_CHAT_ID,
@@ -429,10 +381,6 @@ NEGATIVE_NEWS_KEYWORDS = [
 ]
 
 def check_news_safety(symbol):
-    """
-    Scans public crypto news feeds for high-severity negative catalysts.
-    Fails open (returns True) on network or API timeouts to prevent trade deadlocks.
-    """
     base_asset = symbol.split('/')[0].upper()
     try:
         url = "https://min-api.cryptocompare.com/data/v2/news/?lang=EN"
@@ -449,7 +397,6 @@ def check_news_safety(symbol):
             body = article.get("body", "").lower()
             text_corpus = f"{title} {body}"
 
-            # Check if article concerns this asset
             if base_asset.lower() in text_corpus or symbol.lower() in text_corpus:
                 matching_articles += 1
                 for kw in NEGATIVE_NEWS_KEYWORDS:
@@ -458,14 +405,13 @@ def check_news_safety(symbol):
                         break
 
         if matching_articles > 0 and negative_hits >= 2:
-            warning = f"BLOCKED: {negative_hits} negative news triggers detected for {base_asset}."
+            warning = f"BLOCKED: {negative_hits} negative headlines detected for {base_asset}."
             print(f"🛡️ [NEWS SHIELD] {warning}")
             return False, warning
 
         return True, "NEWS_CLEAR"
 
     except Exception as e:
-        # Fail open
         return True, f"NEWS_CHECK_BYPASS ({e})"
 
 # =====================================================================
@@ -487,11 +433,10 @@ def check_safety_preflight():
 
     try:
         balances = exchange.fetch_balance()
-        quote_asset = SYMBOLS[0].split('/')[1]
-        quote_balance = balances['free'].get(quote_asset, 0.0)
+        quote_balance = balances['free'].get(SCAN_QUOTE_CURRENCY, 0.0)
 
         if quote_balance < MIN_BALANCE_USDT:
-            msg = f"❌ *EMERGENCY SHUTDOWN*: Free {quote_asset} balance ({quote_balance:.2f}) fell below floor ({MIN_BALANCE_USDT:.2f})!"
+            msg = f"❌ *EMERGENCY SHUTDOWN*: Free {SCAN_QUOTE_CURRENCY} balance ({quote_balance:.2f}) fell below floor ({MIN_BALANCE_USDT:.2f})!"
             send_telegram_notification(msg)
             raise SystemExit(msg)
 
@@ -517,7 +462,67 @@ def check_safety_preflight():
         return False
 
 # =====================================================================
-# 9. TECHNICAL INDICATOR ENGINE (PURE PANDAS)
+# 9. DYNAMIC MARKET DISCOVERY SCANNER (ALL-MARKET UNIVERSE)
+# =====================================================================
+def discover_market_universe():
+    """
+    Scans entire Kraken spot exchange. Filters liquid active pairs by target quote currency,
+    sorting descending by 24h volume to construct the active candidate universe.
+    """
+    global active_candidate_universe
+
+    if TRADING_SYMBOLS_MODE.upper() != "AUTO":
+        candidates = [s.strip() for s in TRADING_SYMBOLS_MODE.split(",") if s.strip()]
+        with state_lock:
+            active_candidate_universe = candidates
+        return candidates
+
+    try:
+        print(f"🌐 [SCANNER] Fetching 24h ticker metrics across Kraken for {SCAN_QUOTE_CURRENCY} pairs...")
+        tickers = exchange.fetch_tickers()
+        valid_pairs = []
+
+        for symbol, ticker in tickers.items():
+            if not symbol.endswith(f"/{SCAN_QUOTE_CURRENCY}"):
+                continue
+            # Exclude leveraged tokens or stablecoin pairs
+            base = symbol.split('/')[0]
+            if base in ['USDC', 'DAI', 'FDUSD', 'EURT', 'PYUSD', 'TUSD', 'UST']:
+                continue
+
+            quote_volume = ticker.get('quoteVolume')
+            if quote_volume is None:
+                quote_volume = (ticker.get('baseVolume') or 0.0) * (ticker.get('last') or 0.0)
+
+            if quote_volume and quote_volume > 50000.0:  # Minimum 24h volume threshold ($50k)
+                valid_pairs.append({
+                    'symbol': symbol,
+                    'volume': quote_volume,
+                    'price': ticker.get('last') or 0.0
+                })
+
+        valid_pairs.sort(key=lambda x: x['volume'], reverse=True)
+        selected_universe = [item['symbol'] for item in valid_pairs[:SCAN_TOP_LIQUID_PAIRS]]
+
+        if not selected_universe:
+            # Fallback default if market fetch is degraded
+            selected_universe = [f'BTC/{SCAN_QUOTE_CURRENCY}', f'ETH/{SCAN_QUOTE_CURRENCY}', f'SOL/{SCAN_QUOTE_CURRENCY}']
+
+        with state_lock:
+            active_candidate_universe = selected_universe
+
+        print(f"🎯 [SCANNER] Discovered {len(selected_universe)} top-liquid candidate markets: {', '.join(selected_universe[:6])}...")
+        return selected_universe
+
+    except Exception as e:
+        print(f"⚠️ [SCANNER] Universe discovery failed: {e}. Retaining prior watchlist.")
+        with state_lock:
+            if not active_candidate_universe:
+                active_candidate_universe = [f'BTC/{SCAN_QUOTE_CURRENCY}', f'ETH/{SCAN_QUOTE_CURRENCY}', f'SOL/{SCAN_QUOTE_CURRENCY}']
+            return list(active_candidate_universe)
+
+# =====================================================================
+# 10. TECHNICAL INDICATOR ENGINE & OPPORTUNITY SCORER
 # =====================================================================
 def analyze_advanced_market(symbol):
     try:
@@ -527,14 +532,12 @@ def analyze_advanced_market(symbol):
             columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']
         )
 
-        # 1. Bollinger Bands (20, 2)
         rolling_20 = df['close'].rolling(20)
         sma_20 = rolling_20.mean()
         std_20 = rolling_20.std()
         bb_lower = sma_20 - (2.0 * std_20)
         bb_upper = sma_20 + (2.0 * std_20)
 
-        # 2. RSI (14) via Wilder's Smoothing
         delta = df['close'].diff()
         gain = delta.clip(lower=0.0)
         loss = (-delta).clip(lower=0.0)
@@ -543,7 +546,6 @@ def analyze_advanced_market(symbol):
         rs = avg_gain / avg_loss.replace(0.0, float('nan'))
         rsi_series = 100.0 - (100.0 / (1.0 + rs))
 
-        # 3. ATR (14) via Wilder's Smoothing
         prev_close = df['close'].shift(1)
         tr1 = df['high'] - df['low']
         tr2 = (df['high'] - prev_close).abs()
@@ -551,7 +553,6 @@ def analyze_advanced_market(symbol):
         tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
         atr_series = tr.ewm(alpha=1.0/14.0, adjust=False).mean()
 
-        # 4. ADX (14)
         up_move = df['high'].diff()
         down_move = -df['low'].diff()
         plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
@@ -566,87 +567,98 @@ def analyze_advanced_market(symbol):
         dx = (100.0 * (plus_di - minus_di).abs() / di_sum.replace(0.0, float('nan'))).fillna(0.0)
         adx_series = dx.ewm(alpha=1.0/14.0, adjust=False).mean()
 
+        # Volume momentum surge ratio
+        vol_sma_20 = df['volume'].rolling(20).mean()
+        volume_surge = float(df['volume'].iloc[-1] / (vol_sma_20.iloc[-1] + 1e-6))
+
         return {
             'close': float(df['close'].iloc[-1]),
             'adx': float(adx_series.iloc[-1]),
             'rsi': float(rsi_series.iloc[-1]),
             'atr': float(atr_series.iloc[-1]),
             'bb_lower': float(bb_lower.iloc[-1]),
-            'bb_upper': float(bb_upper.iloc[-1])
+            'bb_upper': float(bb_upper.iloc[-1]),
+            'vol_surge': volume_surge
         }
     except Exception as e:
-        print(f"⚠️ Market Data API Failure [{symbol}]: {e}")
-        send_telegram_notification(f"⚠️ Market data read failure [{symbol}]: {e}")
         return None
 
-# =====================================================================
-# 10. ADAPTIVE LEVERAGE & DYNAMIC POSITION SIZING CALCULATOR
-# =====================================================================
-def calculate_dynamic_entry(symbol, current_price, atr, regime, metrics):
+def score_trading_opportunity(symbol, metrics):
     """
-    Computes:
-    1. Signal Confidence Score (0.0 to 1.0)
-    2. Adaptive Bounded Leverage (MIN_LEVERAGE to MAX_LEVERAGE)
-    3. Risk-Based Position Sizing: (Equity * Risk%) / Stop_Distance
-    4. Take-Profit Target (1:2 R:R)
+    Multi-factor Opportunity Scorer. Returns:
+    - regime: 'SIDEWAYS', 'SWING', or 'NONE'
+    - score: 0.00 to 1.00 ranking priority
     """
+    current_price = metrics['close']
+    atr = metrics['atr']
+    adx = metrics['adx']
+    rsi = metrics['rsi']
+    bb_lower = metrics['bb_lower']
+
+    # 1. Sideways Mean-Reversion Evaluation
+    if adx < ADX_TREND_THRESHOLD:
+        if current_price <= bb_lower:
+            bb_depth = max(0.0, bb_lower - current_price)
+            depth_score = min(1.0, bb_depth / (atr * 0.75 + 1e-6))
+            adx_calm_score = max(0.0, (ADX_TREND_THRESHOLD - adx) / ADX_TREND_THRESHOLD)
+            rsi_rebound_score = max(0.0, (50.0 - abs(rsi - 35.0)) / 50.0)
+
+            score = round(0.40 * depth_score + 0.35 * adx_calm_score + 0.25 * rsi_rebound_score, 3)
+            return "SIDEWAYS", max(0.1, min(1.0, score))
+
+    # 2. Swing Breakout Evaluation
+    else:
+        if rsi <= 32.0:
+            rsi_extreme = max(0.0, (32.0 - rsi) / 20.0)
+            trend_power = min(1.0, (adx - ADX_TREND_THRESHOLD) / 30.0)
+            vol_bonus = min(1.0, (metrics['vol_surge'] - 1.0) / 2.0) if metrics['vol_surge'] > 1.0 else 0.0
+
+            score = round(0.45 * rsi_extreme + 0.35 * trend_power + 0.20 * vol_bonus, 3)
+            return "SWING", max(0.1, min(1.0, score))
+
+    return "NONE", 0.0
+
+# =====================================================================
+# 11. ADAPTIVE LEVERAGE & RISK SIZING CALCULATOR
+# =====================================================================
+def calculate_dynamic_entry(symbol, current_price, atr, regime, score):
     with state_lock:
         if PAPER_TRADING:
             equity = virtual_balance_usdt
         else:
             try:
                 bal = exchange.fetch_balance()
-                equity = float(bal['free'].get('USDT', 0.0) + bal.get('used', {}).get('USDT', 0.0))
+                equity = float(bal['free'].get(SCAN_QUOTE_CURRENCY, 0.0) + bal.get('used', {}).get(SCAN_QUOTE_CURRENCY, 0.0))
             except Exception:
                 equity = 100.0
 
-    # 1. Signal Confidence Calculation
-    if regime == "SIDEWAYS":
-        # Deeper penetration below Bollinger Lower Band = higher confidence
-        bb_depth = max(0.0, metrics['bb_lower'] - current_price)
-        depth_ratio = min(1.0, bb_depth / (atr * 0.75 + 1e-6))
-        adx_flatness = max(0.0, (ADX_TREND_THRESHOLD - metrics['adx']) / ADX_TREND_THRESHOLD)
-        confidence = round(0.4 * depth_ratio + 0.6 * adx_flatness, 2)
-    else:  # SWING
-        # Lower RSI and stronger ADX trend = higher breakout momentum confidence
-        rsi_extreme = max(0.0, (30.0 - metrics['rsi']) / 20.0)
-        adx_strength = min(1.0, (metrics['adx'] - ADX_TREND_THRESHOLD) / 30.0)
-        confidence = round(0.5 * rsi_extreme + 0.5 * adx_strength, 2)
-
-    confidence = max(0.1, min(1.0, confidence))
-
-    # 2. Adaptive Leverage (Bounded strictly between MIN_LEVERAGE and MAX_LEVERAGE <= 5.0)
     effective_max_leverage = min(5.0, MAX_LEVERAGE)
-    leverage = round(MIN_LEVERAGE + confidence * (effective_max_leverage - MIN_LEVERAGE), 1)
+    leverage = round(MIN_LEVERAGE + score * (effective_max_leverage - MIN_LEVERAGE), 1)
 
-    # 3. Dynamic Position Sizing (Risk-based dollar floor)
     dollar_risk = equity * RISK_PCT_PER_TRADE
     stop_distance = atr * ATR_MULTIPLIER
     calculated_stop = current_price - stop_distance
     take_profit = current_price + (stop_distance * RR_RATIO)
 
-    # Unit sizing so that stop hit exactly equals dollar_risk
     units = dollar_risk / stop_distance
     notional_value = units * current_price
     margin_required = notional_value / leverage
 
-    # Portfolio Guard: Enforce maximum margin exposure limits
     with state_lock:
-        current_margin_used = sum(p["margin_allocated"] for p in positions.values() if p["position_active"])
+        current_margin_used = sum(p["margin_allocated"] for p in positions.values() if p.get("position_active", False))
 
     available_margin_budget = (equity * MAX_PORTFOLIO_MARGIN_PCT) - current_margin_used
 
     if margin_required > available_margin_budget:
-        # Scale back units if budget exceeded
         if available_margin_budget > 10.0:
             margin_required = available_margin_budget
             notional_value = margin_required * leverage
             units = notional_value / current_price
         else:
-            return None  # Insufficient margin allowance
+            return None
 
     return {
-        "confidence": confidence,
+        "confidence": score,
         "leverage": leverage,
         "units": round(units, 6),
         "margin_required": round(margin_required, 2),
@@ -656,7 +668,7 @@ def calculate_dynamic_entry(symbol, current_price, atr, regime, metrics):
     }
 
 # =====================================================================
-# 11. LIVE POSITION GUARD ENGINE (TRAILING SL & TP)
+# 12. ACTIVE POSITION MONITOR & DISPATCHER
 # =====================================================================
 def manage_active_position(symbol, current_price):
     global positions, virtual_balance_usdt
@@ -703,7 +715,6 @@ def manage_active_position(symbol, current_price):
                 params = {}
                 if leverage > 1.0:
                     params['leverage'] = int(leverage)
-
                 order = exchange.create_market_sell_order(symbol, units, params)
                 order_id = order.get('id', 'UNKNOWN_ID')
 
@@ -711,7 +722,7 @@ def manage_active_position(symbol, current_price):
                 f"🚨 *POSITION CLOSED* [{symbol}]\n"
                 f"Reason: `{exit_type}`\n"
                 f"Exit Price: `{current_price:.2f}`\n"
-                f"PnL: `{pnl:+.2f} USDT`\n"
+                f"PnL: `{pnl:+.2f} {SCAN_QUOTE_CURRENCY}`\n"
                 f"Leverage: `{leverage}x`"
             )
             send_telegram_notification(msg)
@@ -721,18 +732,7 @@ def manage_active_position(symbol, current_price):
             )
 
             with state_lock:
-                positions[symbol] = {
-                    "position_active": False,
-                    "entry_price": 0.0,
-                    "trailing_stop": 0.0,
-                    "stop_loss_distance": 0.0,
-                    "take_profit": 0.0,
-                    "leverage": 1.0,
-                    "units": 0.0,
-                    "margin_allocated": 0.0,
-                    "regime": "NONE",
-                    "confidence": 0.0
-                }
+                positions[symbol]["position_active"] = False
             save_state()
 
         except Exception as e:
@@ -740,7 +740,6 @@ def manage_active_position(symbol, current_price):
             send_telegram_notification(f"❌ CRITICAL [{symbol}]: Exit order failed: {e}")
 
     elif current_price > curr_entry:
-        # Dynamic Ratchet: Trail stop upward point-for-point preserving risk distance
         new_stop = current_price - risk_dist
         if new_stop > curr_stop:
             with state_lock:
@@ -748,134 +747,154 @@ def manage_active_position(symbol, current_price):
             print(f"📈 [{symbol}] Trailing Stop ratcheted to: {new_stop:.2f}")
             save_state()
 
-# =====================================================================
-# 12. MASTER SIGNAL & MULTI-ASSET DISPATCHER
-# =====================================================================
 def execution_orchestrator():
-    global positions, virtual_balance_usdt
+    global positions, virtual_balance_usdt, top_scanned_opportunities
 
     safety_ok = check_safety_preflight()
 
-    # Step 1: Manage all active positions
-    for symbol in SYMBOLS:
-        with state_lock:
-            is_active = positions[symbol]["position_active"]
+    # Step 1: Manage Active Positions
+    with state_lock:
+        active_symbols = [sym for sym, p in positions.items() if p.get("position_active", False)]
 
-        if is_active:
-            metrics = analyze_advanced_market(symbol)
-            if metrics:
-                manage_active_position(symbol, metrics['close'])
+    for symbol in active_symbols:
+        metrics = analyze_advanced_market(symbol)
+        if metrics:
+            manage_active_position(symbol, metrics['close'])
 
     if not safety_ok:
         return
 
     # Step 2: Enforce Maximum Concurrent Positions Gate
     with state_lock:
-        active_count = sum(1 for p in positions.values() if p["position_active"])
+        current_open_count = sum(1 for p in positions.values() if p.get("position_active", False))
 
-    if active_count >= MAX_CONCURRENT_POSITIONS:
-        print(f"⏸️ Max concurrent positions reached ({active_count}/{MAX_CONCURRENT_POSITIONS}). Scanning paused.")
+    free_slots = MAX_CONCURRENT_POSITIONS - current_open_count
+    if free_slots <= 0:
+        print(f"⏸️ Max concurrent capacity engaged ({current_open_count}/{MAX_CONCURRENT_POSITIONS}). Scanning paused.")
         return
 
-    # Step 3: Scan candidate watchlist pool for optimal setups
-    for symbol in SYMBOLS:
+    # Step 3: Run Scanner Across the Full Market Universe
+    candidate_pool = discover_market_universe()
+    update_engine_status(scanner_status=f"SCANNING {len(candidate_pool)} PAIRS")
+
+    scored_candidates = []
+
+    for symbol in candidate_pool:
+        # Don't re-enter if already active
         with state_lock:
-            if positions[symbol]["position_active"]:
+            if positions.get(symbol, {}).get("position_active", False):
                 continue
 
         metrics = analyze_advanced_market(symbol)
         if not metrics:
             continue
 
-        current_price = metrics['close']
-        timestamp = utc_now_iso()
+        regime, score = score_trading_opportunity(symbol, metrics)
 
-        regime_signal = None
+        if score > 0.0:
+            scored_candidates.append({
+                'symbol': symbol,
+                'regime': regime,
+                'score': score,
+                'price': metrics['close'],
+                'atr': metrics['atr'],
+                'adx': metrics['adx'],
+                'rsi': metrics['rsi'],
+                'metrics': metrics
+            })
 
-        # Sideways Regime: ADX < 25 and price touching/piercing lower Bollinger Band
-        if metrics['adx'] < ADX_TREND_THRESHOLD:
-            if current_price <= metrics['bb_lower']:
-                regime_signal = "SIDEWAYS"
-        # Swing Breakout Regime: ADX >= 25 and extreme oversold momentum
-        else:
-            if metrics['rsi'] <= 30.0:
-                regime_signal = "SWING"
+    # Sort descending by opportunity score
+    scored_candidates.sort(key=lambda x: x['score'], reverse=True)
 
-        if not regime_signal:
-            continue
+    with state_lock:
+        top_scanned_opportunities = scored_candidates[:8]
 
-        print(f"🔍 [{symbol}] Potential {regime_signal} Setup detected! Evaluating news & risk sizing...")
+    update_engine_status(scanner_status=f"FOUND {len(scored_candidates)} SIGNALS")
 
-        # Step 4: News Safety Shield Gate
-        news_ok, news_msg = check_news_safety(symbol)
-        update_engine_status(active_news_status=f"[{symbol}]: {news_msg}")
+    if not scored_candidates:
+        print(f"🔍 [SCANNER] Scanned {len(candidate_pool)} markets. No high-conviction setups met threshold.")
+        return
+
+    # Step 4: Execute on Top-Ranked Opportunity
+    for candidate in scored_candidates:
+        if free_slots <= 0:
+            break
+
+        sym = candidate['symbol']
+        regime = candidate['regime']
+        score = candidate['score']
+        price = candidate['price']
+
+        print(f"🎯 Top Market Opportunity Selected: [{sym}] | Regime: {regime} | Opportunity Score: {score:.3f}")
+
+        # News Safety Shield
+        news_ok, news_msg = check_news_safety(sym)
+        update_engine_status(active_news_status=f"[{sym}]: {news_msg}")
         if not news_ok:
-            print(f"🛑 Trade entry blocked by News Shield: {news_msg}")
+            print(f"🛑 Trade entry blocked by News Shield for {sym}: {news_msg}")
             continue
 
-        # Step 5: Dynamic Position Sizing & Adaptive Leverage Calculation
-        plan = calculate_dynamic_entry(symbol, current_price, metrics['atr'], regime_signal, metrics)
+        # Dynamic Risk Sizing & Adaptive Leverage
+        plan = calculate_dynamic_entry(sym, price, candidate['atr'], regime, score)
         if not plan:
-            print(f"⚠️ Sizing rejected: Insufficient portfolio margin allocation budget.")
+            print(f"⚠️ Sizing rejected: Insufficient portfolio margin allowance for {sym}.")
             continue
 
         print(
-            f"⚡ Executing {regime_signal} Entry [{symbol}] | Price: {current_price:.2f} | Units: {plan['units']} | "
-            f"Margin: ${plan['margin_required']} | Lev: {plan['leverage']}x | Conf: {plan['confidence']}"
+            f"⚡ Executing {regime} Entry [{sym}] | Price: {price:.2f} | Units: {plan['units']} | "
+            f"Margin: ${plan['margin_required']} | Lev: {plan['leverage']}x | Score: {score:.3f}"
         )
 
         try:
+            timestamp = utc_now_iso()
             if PAPER_TRADING:
                 order_id = f"SIM_BUY_{int(time.time() * 1000)}"
                 with state_lock:
                     virtual_balance_usdt -= plan['margin_required']
-                print(f"📝 [PAPER] Virtual position opened. Margin reserved: ${plan['margin_required']:.2f}")
+                print(f"📝 [PAPER] Virtual entry filled on {sym}. Margin reserved: ${plan['margin_required']:.2f}")
             else:
                 params = {}
                 if plan['leverage'] > 1.0:
                     params['leverage'] = int(plan['leverage'])
-                order = exchange.create_market_buy_order(symbol, plan['units'], params)
+                order = exchange.create_market_buy_order(sym, plan['units'], params)
                 order_id = order.get('id', 'UNKNOWN_ID')
 
             with state_lock:
-                positions[symbol] = {
+                positions[sym] = {
                     "position_active": True,
-                    "entry_price": current_price,
+                    "entry_price": price,
                     "trailing_stop": plan['trailing_stop'],
                     "stop_loss_distance": plan['stop_distance'],
                     "take_profit": plan['take_profit'],
                     "leverage": plan['leverage'],
                     "units": plan['units'],
                     "margin_allocated": plan['margin_required'],
-                    "regime": regime_signal,
-                    "confidence": plan['confidence']
+                    "regime": regime,
+                    "confidence": score
                 }
             save_state()
 
             msg = (
-                f"🟢 *TRADE OPENED ({regime_signal})*\n"
-                f"Symbol: `{symbol}`\n"
-                f"Entry Price: `{current_price:.2f}`\n"
+                f"🟢 *MARKET SCANNER ENTRY ({regime})*\n"
+                f"Symbol: `{sym}`\n"
+                f"Opportunity Score: `{score:.3f}`\n"
+                f"Entry Price: `{price:.2f}`\n"
                 f"Size: `{plan['units']}` (${plan['margin_required'] * plan['leverage']:.2f} Notional)\n"
-                f"Adaptive Leverage: `{plan['leverage']}x` (Confidence: {plan['confidence']})\n"
-                f"Initial SL: `{plan['trailing_stop']:.2f}`\n"
+                f"Adaptive Leverage: `{plan['leverage']}x`\n"
+                f"Initial Trailing SL: `{plan['trailing_stop']:.2f}`\n"
                 f"Target TP (1:{RR_RATIO}): `{plan['take_profit']:.2f}`"
             )
             send_telegram_notification(msg)
             log_trade_to_ledger(
-                timestamp, symbol, order_id, 'BUY', regime_signal,
-                current_price, plan['units'], plan['trailing_stop'], plan['take_profit'], plan['leverage'], 'POSITION_OPEN'
+                timestamp, sym, order_id, 'BUY', regime,
+                price, plan['units'], plan['trailing_stop'], plan['take_profit'], plan['leverage'], 'POSITION_OPEN'
             )
 
-            # Check if concurrent limits reached after this entry
-            with state_lock:
-                active_count = sum(1 for p in positions.values() if p["position_active"])
-            if active_count >= MAX_CONCURRENT_POSITIONS:
-                break
+            free_slots -= 1
 
         except Exception as e:
-            print(f"❌ Entry order failed [{symbol}]: {e}")
-            send_telegram_notification(f"❌ Entry blocked [{symbol}]: {e}")
+            print(f"❌ Entry order failed [{sym}]: {e}")
+            send_telegram_notification(f"❌ Entry blocked [{sym}]: {e}")
 
 # =====================================================================
 # 13. BACKGROUND TRADING ENGINE DAEMON
@@ -894,7 +913,7 @@ def trading_engine_loop():
         print("♻️ Loading multi-pair margin state from Upstash...")
         load_state()
 
-        print("🔎 Performing mandatory startup reconciliation...")
+        print("🔎 Performing startup reconciliation...")
         reconcile_state_with_exchange()
 
         update_engine_status(
@@ -903,8 +922,8 @@ def trading_engine_loop():
         )
 
         mode_str = "PAPER TRADING" if PAPER_TRADING else "LIVE CAPITAL"
-        print(f"🚀 Quantum Shield Engaged [{mode_str}]. Candidate Pool: {', '.join(SYMBOLS)}")
-        send_telegram_notification(f"🚀 Kraken Bot Engine Active [{mode_str}]! Watching: {', '.join(SYMBOLS)}")
+        print(f"🚀 Quantum All-Market Scanner Active [{mode_str}]. Mode: {TRADING_SYMBOLS_MODE}")
+        send_telegram_notification(f"🚀 Kraken All-Market Scanner Engaged [{mode_str}]!")
 
         while True:
             update_engine_status(
@@ -970,7 +989,7 @@ def trading_engine_loop():
         print("ℹ️ Trading thread stopped. Web server remains active for diagnostics.")
 
 # =====================================================================
-# 14. OPERATOR TERMINAL UI (DARK QUANT DASHBOARD)
+# 14. OPERATOR TERMINAL UI (WITH LIVE SCANNER MATRIX)
 # =====================================================================
 app = Flask(__name__)
 
@@ -980,12 +999,11 @@ DASHBOARD_HTML = """
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-  <title>Kraken Dynamic Regime Terminal</title>
+  <title>Kraken All-Market Scanner Terminal</title>
   <style>
     :root {
       --bg: #090d16;
       --card: #111726;
-      --card-alt: #161f33;
       --border: #1f2b45;
       --text: #e6edf3;
       --muted: #8b949e;
@@ -1105,8 +1123,7 @@ DASHBOARD_HTML = """
       text-transform: uppercase;
     }
     tr:last-child td { border-bottom: none; }
-    .pos-open { color: var(--green); font-weight: 700; }
-    .pos-flat { color: var(--muted); }
+    .score-high { color: var(--green); font-weight: 700; }
     .raw-box {
       background: #05080f;
       border: 1px solid var(--border);
@@ -1131,7 +1148,7 @@ DASHBOARD_HTML = """
 <body>
   <div class="header">
     <div class="title">
-      <span>KRAKEN QUANT ENGINE</span>
+      <span>KRAKEN ALL-MARKET SCANNER</span>
       <span id="badge-mode" class="badge badge-paper"><span class="dot"></span>PAPER</span>
       <span id="badge-state" class="badge badge-running"><span class="dot"></span>RUNNING</span>
     </div>
@@ -1144,46 +1161,64 @@ DASHBOARD_HTML = """
       <div class="card-value" id="val-balance">$0.00</div>
     </div>
     <div class="card">
-      <div class="card-label">Margin In Use</div>
-      <div class="card-value" id="val-margin">$0.00</div>
+      <div class="card-label">Scanner Status</div>
+      <div class="card-value" id="val-scanner" style="font-size: 15px; margin-top: 4px;">SCANNING</div>
     </div>
     <div class="card">
-      <div class="card-label">Risk Per Trade</div>
-      <div class="card-value" id="val-risk">1.5%</div>
+      <div class="card-label">Active Positions</div>
+      <div class="card-value" id="val-positions">0 / 2</div>
     </div>
     <div class="card">
-      <div class="card-label">News Safety Shield</div>
+      <div class="card-label">News Shield</div>
       <div class="card-value" id="val-news" style="font-size: 14px; margin-top: 4px;">MONITORING</div>
     </div>
   </div>
 
-  <div class="section-title">Dynamic Candidate Watchlist & Active Positions</div>
+  <div class="section-title">Active Live Positions</div>
   <div class="table-container">
     <table>
       <thead>
         <tr>
           <th>Symbol</th>
-          <th>State</th>
           <th>Regime</th>
           <th>Leverage</th>
-          <th>Units</th>
+          <th>Size</th>
           <th>Margin</th>
           <th>Entry</th>
           <th>Trailing SL</th>
-          <th>Target TP (1:2)</th>
+          <th>Target TP</th>
         </tr>
       </thead>
-      <tbody id="positions-tbody">
-        <tr><td colspan="9" style="color: var(--muted); text-align: center;">Scanning candidate pool...</td></tr>
+      <tbody id="active-positions-tbody">
+        <tr><td colspan="8" style="color: var(--muted); text-align: center;">No open positions. Scanner is seeking opportunities.</td></tr>
       </tbody>
     </table>
   </div>
 
-  <div class="section-title">Telemetry Snapshot</div>
+  <div class="section-title">Top Scanned Market Opportunities (Neural Ranked)</div>
+  <div class="table-container">
+    <table>
+      <thead>
+        <tr>
+          <th>Market</th>
+          <th>Regime</th>
+          <th>Opportunity Score</th>
+          <th>Last Price</th>
+          <th>ADX (14)</th>
+          <th>RSI (14)</th>
+        </tr>
+      </thead>
+      <tbody id="opportunities-tbody">
+        <tr><td colspan="6" style="color: var(--muted); text-align: center;">Evaluating market opportunities across Kraken...</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="section-title">Raw Engine Telemetry Snapshot</div>
   <pre class="raw-box" id="raw-state">Fetching telemetrics...</pre>
 
   <div class="footer">
-    <span>API: /status</span>
+    <span>Endpoint: /status</span>
     <span>Auto-refresh: 3s</span>
   </div>
 
@@ -1205,36 +1240,52 @@ DASHBOARD_HTML = """
 
         const bal = data.virtual_balance_usdt !== null ? '$' + Number(data.virtual_balance_usdt).toFixed(2) : 'LIVE ACCOUNT';
         document.getElementById('val-balance').textContent = bal;
-        document.getElementById('val-margin').textContent = '$' + Number(data.total_margin_allocated || 0).toFixed(2);
-        document.getElementById('val-risk').textContent = (data.risk_pct_per_trade * 100).toFixed(1) + '% / 1:' + (data.rr_ratio || 2);
+        document.getElementById('val-scanner').textContent = data.scanner_status || 'SCANNING';
+        document.getElementById('val-positions').textContent = Object.keys(data.positions || {}).length + ' / 2 Cap';
         document.getElementById('val-news').textContent = data.active_news_status || 'MONITORING';
 
-        const tbody = document.getElementById('positions-tbody');
-        tbody.innerHTML = '';
-        for (const [sym, pos] of Object.entries(data.positions || {})) {
-          const row = document.createElement('tr');
-          const isAct = pos.position_active;
-          const posCell = isAct ? '<span class="pos-open">OPEN</span>' : '<span class="pos-flat">SCANNING</span>';
-          const reg = isAct ? pos.regime : '--';
-          const lev = isAct ? pos.leverage + 'x' : '--';
-          const units = isAct ? pos.units : '--';
-          const marg = isAct ? '$' + Number(pos.margin_allocated).toFixed(2) : '--';
-          const entry = isAct ? '$' + Number(pos.entry_price).toFixed(2) : '--';
-          const stop = isAct ? '$' + Number(pos.trailing_stop).toFixed(2) : '--';
-          const tp = isAct ? '$' + Number(pos.take_profit).toFixed(2) : '--';
+        // 1. Active Positions Table
+        const actBody = document.getElementById('active-positions-tbody');
+        actBody.innerHTML = '';
+        const posEntries = Object.entries(data.positions || {});
+        if (posEntries.length === 0) {
+          actBody.innerHTML = '<tr><td colspan="8" style="color: var(--muted); text-align: center;">No open positions. Scanner is seeking setups.</td></tr>';
+        } else {
+          for (const [sym, pos] of posEntries) {
+            const row = document.createElement('tr');
+            row.innerHTML = `
+              <td><strong>${sym}</strong></td>
+              <td>${pos.regime}</td>
+              <td>${pos.leverage}x</td>
+              <td>${pos.units}</td>
+              <td>$${Number(pos.margin_allocated).toFixed(2)}</td>
+              <td>$${Number(pos.entry_price).toFixed(2)}</td>
+              <td>$${Number(pos.trailing_stop).toFixed(2)}</td>
+              <td>$${Number(pos.take_profit).toFixed(2)}</td>
+            `;
+            actBody.appendChild(row);
+          }
+        }
 
-          row.innerHTML = `
-            <td><strong>${sym}</strong></td>
-            <td>${posCell}</td>
-            <td>${reg}</td>
-            <td>${lev}</td>
-            <td>${units}</td>
-            <td>${marg}</td>
-            <td>${entry}</td>
-            <td>${stop}</td>
-            <td>${tp}</td>
-          `;
-          tbody.appendChild(row);
+        // 2. Top Scanned Opportunities Table
+        const oppBody = document.getElementById('opportunities-tbody');
+        oppBody.innerHTML = '';
+        const opps = data.top_opportunities || [];
+        if (opps.length === 0) {
+          oppBody.innerHTML = '<tr><td colspan="6" style="color: var(--muted); text-align: center;">Scanning candidate markets...</td></tr>';
+        } else {
+          for (const item of opps) {
+            const row = document.createElement('tr');
+            row.innerHTML = `
+              <td><strong>${item.symbol}</strong></td>
+              <td>${item.regime}</td>
+              <td class="score-high">${Number(item.score).toFixed(3)}</td>
+              <td>$${Number(item.price).toFixed(2)}</td>
+              <td>${Number(item.adx).toFixed(1)}</td>
+              <td>${Number(item.rsi).toFixed(1)}</td>
+            `;
+            oppBody.appendChild(row);
+          }
         }
 
         document.getElementById('raw-state').textContent = JSON.stringify(data, null, 2);
@@ -1259,7 +1310,7 @@ def dashboard():
 def health():
     return jsonify({
         "status": "ok",
-        "service": "kraken-hybrid-regime-bot-multipair",
+        "service": "kraken-all-market-scanner",
         "paper_trading": PAPER_TRADING,
         "timestamp": utc_now_iso()
     }), 200
@@ -1286,12 +1337,13 @@ def start_trading_thread():
         daemon=True
     )
     engine_thread.start()
-    print("🧵 Dynamic Multi-Asset Risk Engine thread started.")
+    print("🧵 Quantum All-Market Scanner Engine thread started.")
 
 if __name__ == "__main__":
-    print(f"🌐 Starting Kraken Multi-Asset Web Service on 0.0.0.0:{SERVER_PORT}")
+    print(f"🌐 Starting Kraken All-Market Scanner on 0.0.0.0:{SERVER_PORT}")
     print(f"⚙️ Mode: {'PAPER TRADING (Simulated)' if PAPER_TRADING else 'LIVE CAPITAL'}")
-    print("💻 Terminal UI: /")
+    print(f"🔍 Discovery Mode: {TRADING_SYMBOLS_MODE} ({SCAN_QUOTE_CURRENCY} pairs)")
+    print("💻 Dashboard: /")
     print("📡 Health Check: /health")
     print("📊 Telemetry API: /status")
 

@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: kraken-hybrid-regime-bot
+    runtime: python
+    plan: free
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python kraken_bot_hardened.py"
+    healthCheckPath: /health
+    autoDeploy: true
